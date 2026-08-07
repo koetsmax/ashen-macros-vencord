@@ -1,6 +1,6 @@
 # Ashen Macros ↔ Vencord Bridge
 
-Private **Vencord userplugin** that listens on a localhost WebSocket and drives Discord through webpack modules only (`MessageActions`, `ChannelRouter` / `NavigationRouter`, `ApplicationCommandIndexStore`, `RestAPI`). No DOM scraping, no composer typing.
+Private **Vencord userplugin** that listens on a localhost WebSocket and drives Discord through webpack modules only (`MessageActions`, `ChannelRouter`, `ApplicationCommandIndexStore`, `RestAPI`). No DOM scraping, no composer typing.
 
 Ashen Macros (PySide6) remains the brain; this plugin is the hands inside Discord.
 
@@ -17,7 +17,7 @@ Ashen Macros (PySide6) remains the brain; this plugin is the hands inside Discor
 git clone https://github.com/koetsmax/ashen-macros-vencord.git /path/to/Vencord/src/userplugins/ashenMacrosBridge
 ```
 
-Folder name can be `ashenMacrosBridge` or similar; Vencord loads any `userplugins/*/index.ts`.
+Folder name can be `ashenMacrosBridge` or similar; Vencord loads any `userplugins/*/index.ts(x)`.
 
 2. Rebuild Vencord (`pnpm build` / your usual inject flow) and restart Discord.
 
@@ -59,9 +59,30 @@ On connect the plugin sends:
 | `react` | `channelId`, `messageId`, `emoji: { name, id? }` or string | `MessageActions.addReaction` |
 | `edit` | `channelId`, `messageId`, `content` | `MessageActions.editMessage` |
 | `send` | `channelId`, `content` | `MessageActions.sendMessage` |
-| `switchChannel` | `channelId`, optional `guildId` | `ChannelRouter.transitionToChannel` (fallback `NavigationRouter`) |
+| `switchChannel` | `channelId`, optional `guildId` | `ChannelRouter.transitionToChannel` |
 | `messageCommand` | `channelId`, `messageId`, optional `name` (default `"update bonus"`), optional `guildId` | MESSAGE context command via index + `POST /interactions` |
-| `slashCommand` | `channelId`, `name`, optional `options: [{ name, type?, value }]`, optional `guildId` | CHAT_INPUT slash via same `/interactions` path (Phase 2) |
+| `slashCommand` | `channelId`, `name`, optional `options: [{ name, type?, value?, options?, autocomplete? }]`, optional `guildId` | CHAT_INPUT slash via same `/interactions` path; options with bot-side autocomplete are resolved automatically. Nested `options` are used for SUB_COMMAND (type 1) |
+| `autocomplete` | `channelId`, `name`, `optionName`, `query`, optional `options`, `guildId`, `choiceIndex` | Fetch slash-option choices (display name → value) without submitting |
+
+### Slash option `type`
+
+Discord application-command option types (the Bridge tests “type” spinbox):
+
+| Type | Name | Value shape | Typical use |
+|---:|---|---|---|
+| 1 | `SUB_COMMAND` | nested options | Subcommand under a group |
+| 2 | `SUB_COMMAND_GROUP` | nested subcommands | Group of subcommands |
+| 3 | `STRING` | string | Free text; **also** Ashen autocomplete options (`target`, `ship`) — query in, UUID/value out |
+| 4 | `INTEGER` | integer | Whole numbers |
+| 5 | `BOOLEAN` | `true` / `false` | Flags (e.g. unprep) |
+| 6 | `USER` | snowflake user id | Discord user picker (not Ashen prep/process `target`) |
+| 7 | `CHANNEL` | snowflake channel id | Channel picker |
+| 8 | `ROLE` | snowflake role id | Role picker |
+| 9 | `MENTIONABLE` | user or role snowflake | User or role |
+| 10 | `NUMBER` | float | Decimal numbers |
+| 11 | `ATTACHMENT` | attachment id | File upload |
+
+For `/prep` and `/process`, use **type 3** (`STRING`) with the value you would type before Tab (Discord user id, ship query like `1 5`). Set `"autocomplete": true` on the option (or rely on the command schema) so the bridge resolves the visible label to the UUID Discord actually submits.
 
 ### Examples
 
@@ -73,17 +94,20 @@ On connect the plugin sends:
 { "id": "5", "type": "send", "channelId": "…", "content": "hello" }
 { "id": "6", "type": "switchChannel", "channelId": "…" }
 { "id": "7", "type": "messageCommand", "name": "update bonus", "channelId": "…", "messageId": "…" }
-{ "id": "8", "type": "slashCommand", "name": "process", "channelId": "…", "options": [{ "name": "user", "type": 6, "value": "123" }, { "name": "ship", "type": 3, "value": "…" }] }
-{ "id": "9", "type": "cancel", "targetId": "8" }
+{ "id": "8", "type": "slashCommand", "name": "prep", "channelId": "…", "options": [{ "name": "target", "type": 3, "value": "123456789012345678", "autocomplete": true }] }
+{ "id": "9", "type": "slashCommand", "name": "process", "channelId": "…", "options": [{ "name": "target", "type": 3, "value": "123…", "autocomplete": true }, { "name": "ship", "type": 3, "value": "1 5", "autocomplete": true }] }
+{ "id": "9b", "type": "slashCommand", "name": "message-store", "channelId": "…", "options": [{ "name": "recall", "type": 1, "options": [{ "name": "name", "type": 3, "value": "Ships full" }] }] }
+{ "id": "10", "type": "autocomplete", "name": "prep", "channelId": "…", "optionName": "target", "query": "123456789012345678" }
+{ "id": "11", "type": "cancel", "targetId": "8" }
 ```
 
 ## Architecture
 
 | File | Role |
 |---|---|
-| `index.ts` | `definePlugin`, settings, start/stop, cancel map, renderer request dispatch |
+| `index.tsx` | `definePlugin`, settings, start/stop, cancel map, renderer request dispatch |
 | `native.ts` | Electron main: `127.0.0.1` WebSocket server → `webContents.executeJavaScript` into Discord |
-| `actions.ts` | MessageActions / ChannelRouter / RestAPI interaction submitter |
+| `actions.ts` | ReactionActions / MessageActions / ChannelRouter / RestAPI interaction submitter |
 | `types.ts` | Request/response TypeScript shapes |
 
 Renderer cannot open a listening socket (browser WebSocket is client-only), so the server lives in `native.ts` and forwards each request into the Discord renderer where webpack modules exist.

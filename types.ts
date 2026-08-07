@@ -12,7 +12,8 @@ export type BridgeActionType =
     | "send"
     | "switchChannel"
     | "messageCommand"
-    | "slashCommand";
+    | "slashCommand"
+    | "autocomplete";
 
 export interface EmojiRef {
     name: string;
@@ -24,7 +25,19 @@ export interface SlashOption {
     name: string;
     /** Discord application-command option type (3=STRING, 5=BOOLEAN, 6=USER, …). Optional if inferred. */
     type?: number;
-    value: string | number | boolean;
+    value?: string | number | boolean;
+    /** Nested options for SUB_COMMAND / SUB_COMMAND_GROUP (type 1 / 2). */
+    options?: SlashOption[];
+    /**
+     * Force Discord autocomplete resolution for this option (query → choice value).
+     * Usually unnecessary: options with autocomplete=true in the command schema are resolved automatically.
+     */
+    autocomplete?: boolean;
+}
+
+export interface AutocompleteChoice {
+    name: string;
+    value: string | number;
 }
 
 /** Client → plugin */
@@ -39,7 +52,11 @@ export interface BridgeRequest {
     targetId?: string;
     cancelId?: string;
 
-    // react / edit / send / switch / commands
+    // ping
+    /** Artificial delay (ms) before pong — used by Bridge tests Escape/cancel harness. */
+    delayMs?: number;
+
+    // react / edit / send / switch / commands / autocomplete
     channelId?: string;
     messageId?: string;
     guildId?: string;
@@ -47,6 +64,14 @@ export interface BridgeRequest {
     emoji?: EmojiRef | string;
     name?: string;
     options?: SlashOption[];
+
+    // autocomplete
+    /** Option name to focus (e.g. "target"). */
+    optionName?: string;
+    /** Text currently typed into the focused option (e.g. Discord user id). */
+    query?: string;
+    /** Prefer this choice index after autocomplete (default: best match / first). */
+    choiceIndex?: number;
 }
 
 /** Plugin → client */
