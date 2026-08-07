@@ -134,7 +134,7 @@ async function stopBridge() {
 }
 
 export default definePlugin({
-    name: PLUGIN_NAME,
+    name: "AshenMacrosBridge",
     description:
         "Localhost WebSocket bridge for Ashen Macros — react/edit/send/channel switch and app commands via webpack modules (no DOM).",
     authors: [{ name: "koetsmax", id: 0n }],
