@@ -1,0 +1,7 @@
+{
+  "name": "ashen-macros-vencord",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Vencord userplugin: localhost WebSocket bridge for Ashen Macros (webpack MessageActions / RestAPI only)",
+  "license": "GPL-3.0-or-later"
+}
