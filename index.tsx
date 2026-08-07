@@ -44,7 +44,7 @@ function getNative(): NativeApi | null {
 const inflight = new Map<string, AbortController>();
 
 function cancelledResponse(id: string): BridgeResponse {
-    return { id, ok: false, error: "cancelled" };
+    return { id, ok: false, error: "cancelled", cancelled: true };
 }
 
 async function dispatchRequest(raw: BridgeRequest): Promise<BridgeResponse> {
@@ -59,9 +59,10 @@ async function dispatchRequest(raw: BridgeRequest): Promise<BridgeResponse> {
     }
 
     if (raw.type === "cancel") {
-        const target = String(raw.targetId ?? raw.cancelId ?? "");
+        // Python sends {"id": <targetRequestId>, "type": "cancel"} — treat id as target
+        // when targetId/cancelId are omitted.
+        const target = String(raw.targetId ?? raw.cancelId ?? id);
         if (!target) {
-            // Cancel everything currently in flight
             for (const [, ac] of inflight) ac.abort();
             inflight.clear();
             return { id, ok: true, cancelled: "all" };
@@ -72,25 +73,21 @@ async function dispatchRequest(raw: BridgeRequest): Promise<BridgeResponse> {
             inflight.delete(target);
             return { id, ok: true, cancelled: target };
         }
+        // Still report success so the client unblocks; nothing may be in-flight anymore.
         return { id, ok: true, cancelled: target, note: "no matching in-flight op" };
-    }
-
-    if (raw.type === "ping") {
-        const started = Date.now();
-        return { id, ok: true, pong: true, latencyMs: Date.now() - started };
     }
 
     const ac = new AbortController();
     inflight.set(id, ac);
 
     try {
-        const data = await handleAction(raw);
+        const data = await handleAction(raw, ac.signal);
         if (ac.signal.aborted) {
             return cancelledResponse(id);
         }
         return { id, ok: true, ...data };
     } catch (err) {
-        if (ac.signal.aborted) {
+        if (ac.signal.aborted || asErrorMessage(err) === "cancelled") {
             return cancelledResponse(id);
         }
         return { id, ok: false, error: asErrorMessage(err) };
