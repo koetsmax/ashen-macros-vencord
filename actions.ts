@@ -84,6 +84,14 @@ function isUnknownIntegrationError(err: unknown): boolean {
     return text.includes("unknown integration") || text.includes("(10005)");
 }
 
+/** Last successful guild/user install type per application — avoids a failed POST + retry on every call. */
+const preferredIntegrationTypeByApp = new Map<string, number>();
+
+function rememberIntegrationType(applicationId: string | undefined, type: number): void {
+    if (!applicationId || !Number.isFinite(type)) return;
+    preferredIntegrationTypeByApp.set(String(applicationId), type);
+}
+
 function normalizeIntegrationTypes(raw: unknown): number[] {
     if (raw == null) return [];
     if (typeof raw === "number" && Number.isFinite(raw)) return [raw];
@@ -116,6 +124,11 @@ function resolveApplicationId(cmd: any): string {
 }
 
 function pickIntegrationType(cmd: any, guildId?: string): number {
+    const applicationId = resolveApplicationId(cmd);
+    const cached = preferredIntegrationTypeByApp.get(applicationId);
+    if (cached === INTEGRATION_TYPE_GUILD || cached === INTEGRATION_TYPE_USER) {
+        return cached;
+    }
     const explicit = cmd?.integration_type ?? cmd?.integrationType;
     if (explicit === 0 || explicit === 1 || explicit === "0" || explicit === "1") {
         return Number(explicit);
@@ -633,16 +646,21 @@ async function postApplicationCommand(body: Record<string, unknown>): Promise<vo
 async function postApplicationCommandWithIntegrationFallback(
     body: Record<string, unknown>
 ): Promise<number> {
+    const applicationId = body.application_id != null ? String(body.application_id) : undefined;
     const firstType = Number(body.integration_type);
     try {
         await postApplicationCommand(body);
+        rememberIntegrationType(applicationId, firstType);
         return firstType;
     } catch (err) {
         if (!isUnknownIntegrationError(err) || !Number.isFinite(firstType)) throw err;
         const alt = alternateIntegrationType(firstType);
+        // Brief pause so a failed attempt is less likely to trip Discord's interaction bucket.
+        await new Promise(r => setTimeout(r, 350));
         const retry = { ...body, integration_type: alt };
         await postApplicationCommand(retry);
         body.integration_type = alt;
+        rememberIntegrationType(applicationId, alt);
         return alt;
     }
 }
@@ -1531,9 +1549,12 @@ async function resolveSlashOptions(
             continue;
         }
 
+        const callerAuto = options?.find(o => o.name === opt.name)?.autocomplete;
+        // Explicit false wins (skip POST even if the schema marks autocomplete).
+        // Explicit true or schema autocomplete → resolve via Discord.
         const wantsAuto =
-            options?.find(o => o.name === opt.name)?.autocomplete === true ||
-            def?.autocomplete === true;
+            callerAuto === true
+            || (callerAuto !== false && def?.autocomplete === true);
 
         if (!wantsAuto) {
             out.push({ name: opt.name, type: opt.type, value: opt.value });
@@ -1715,7 +1736,7 @@ export async function handleAction(
                     await new Promise(r => setTimeout(r, Math.min(step, end - Date.now())));
                 }
             }
-            return { pong: true, delayMs, version: "2026.33.5", plugin: "AshenMacrosBridge" };
+            return { pong: true, delayMs, version: "2026.33.8", plugin: "AshenMacrosBridge" };
         }
 
         case "react": {

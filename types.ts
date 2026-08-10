@@ -30,8 +30,10 @@ export interface SlashOption {
     /** Nested options for SUB_COMMAND / SUB_COMMAND_GROUP (type 1 / 2). */
     options?: SlashOption[];
     /**
-     * Force Discord autocomplete resolution for this option (query → choice value).
-     * Usually unnecessary: options with autocomplete=true in the command schema are resolved automatically.
+     * Autocomplete resolution for this option (query → choice value).
+     * - `true`: always POST an autocomplete interaction
+     * - `false`: never (even if the command schema marks the option autocomplete)
+     * - omitted: follow the command schema
      */
     autocomplete?: boolean;
 }
