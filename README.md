@@ -41,7 +41,7 @@ Folder name can be `ashenMacrosBridge` or similar; Vencord loads any `userplugin
 On connect the plugin sends:
 
 ```json
-{ "type": "hello", "needsAuth": true, "plugin": "AshenMacrosBridge", "version": "2026.33.1" }
+{ "type": "hello", "needsAuth": true, "plugin": "AshenMacrosBridge", "version": "version" }
 ```
 
 (`needsAuth` is `false` if the query token already matched.)
@@ -118,7 +118,7 @@ Renderer cannot open a listening socket (browser WebSocket is client-only), so t
 
 ## Caveats
 
-- **`messageCommand` / `slashCommand`** use Discord’s undocumented client `POST /interactions` path. Command `id`/`version` come from `ApplicationCommandIndexStore`. On a miss the plugin tries `query(..., { allowFetch: true })` once; if that still fails, open slash/Apps once in that channel (Discord’s reliable warm path), then retry. Ashen Macros shows a toast when this happens.
+- **`messageCommand` / `slashCommand`** use Discord’s undocumented client `POST /interactions` path. Command `id`/`version` come from `ApplicationCommandIndexStore`. Nested commands (e.g. `/message-store recall`) are often indexed as the leaf (`recall`) with `rootCommand`; the plugin matches the parent via `rootCommand` and still submits the root command id/name with nested options. On a miss it tries `query(..., { allowFetch: true })` once (including subcommand query hints); if that still fails, open slash/Apps once in that channel, then retry. Ashen Macros shows a toast when this happens.
 - Interaction body shape can drift with Discord updates — capture a real Network-tab `interactions` payload if submits start failing.
 - `session_id` is resolved via webpack `getSessionId`; if that finder breaks after a Discord update, command actions will error until updated.
 - Cancel cannot unwind an HTTP call Discord already accepted; it stops applying/chaining the in-flight handler result.

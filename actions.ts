@@ -235,11 +235,33 @@ function messageResolvedPayload(channelId: string, messageId: string): Record<st
     }
 }
 
+function commandRootName(cmd: any): string {
+    const root = cmd?.rootCommand ?? cmd?.root_command;
+    return String(
+        root?.name
+        ?? root?.displayName
+        ?? root?.untranslatedName
+        ?? cmd?.rootName
+        ?? cmd?.root_name
+        ?? ""
+    ).trim();
+}
+
+function commandLeafName(cmd: any): string {
+    return String(
+        cmd?.name ?? cmd?.displayName ?? cmd?.untranslatedName ?? ""
+    ).trim();
+}
+
 function commandMatches(cmd: any, name: string, type: number): boolean {
     if (!cmd) return false;
-    const n = (cmd.name ?? cmd.displayName ?? "").toLowerCase();
-    if (n !== name.toLowerCase()) return false;
-    const t = cmd.type ?? cmd.inputType;
+    const want = name.toLowerCase();
+    const leaf = commandLeafName(cmd).toLowerCase();
+    const root = commandRootName(cmd).toLowerCase();
+    // Parent command, or indexed subcommand leaf whose root is the parent
+    // (Discord indexes `/message-store recall` as name="recall" + rootCommand).
+    if (leaf !== want && root !== want) return false;
+    const t = cmd.type ?? cmd.inputType ?? cmd.rootCommand?.type ?? cmd.root_command?.type;
     // MESSAGE / USER context commands must match type exactly — a null type is not good enough.
     if (type === COMMAND_TYPE_MESSAGE || type === 2) {
         return t === type;
@@ -247,11 +269,37 @@ function commandMatches(cmd: any, name: string, type: number): boolean {
     return t == null || t === type;
 }
 
+/** Prefer the root application command when the index returned a subcommand leaf. */
+function unwrapRootApplicationCommand(cmd: any): any {
+    const root = cmd?.rootCommand ?? cmd?.root_command;
+    if (!root || typeof root !== "object") return cmd;
+    // Keep leaf options path if root lacks a full options schema.
+    const merged = { ...root };
+    if (merged.options == null && cmd.options != null) merged.options = cmd.options;
+    if (merged.id == null && root.id != null) merged.id = root.id;
+    // Some builds put the real snowflake on the leaf under applicationId / root.
+    if (merged.application_id == null && merged.applicationId == null) {
+        merged.application_id =
+            root.application_id
+            ?? root.applicationId
+            ?? cmd.application_id
+            ?? cmd.applicationId;
+    }
+    return merged;
+}
+
 /**
  * Resolve an application command from the client index.
  * Query shape varies across Discord builds — try several entry points.
+ * For commands with subcommands, Discord often indexes the leaf (`recall`)
+ * with ``rootCommand.name`` = parent (`message-store`).
  */
-function findApplicationCommand(channelId: string, name: string, type: number): any {
+function findApplicationCommand(
+    channelId: string,
+    name: string,
+    type: number,
+    queryHints: string[] = []
+): any {
     const channel = ChannelStore.getChannel(channelId);
     if (!channel) throw new Error(`Channel not found: ${channelId}`);
 
@@ -262,6 +310,23 @@ function findApplicationCommand(channelId: string, name: string, type: number): 
         { channelId, guildId },
         channel,
     ];
+
+    const texts = [
+        name,
+        ...queryHints.map(h => h.trim()).filter(Boolean),
+        ...queryHints
+            .map(h => h.trim())
+            .filter(Boolean)
+            .map(h => `${name} ${h}`),
+    ];
+    // de-dupe while preserving order
+    const seenText = new Set<string>();
+    const queryTexts = texts.filter(t => {
+        const key = t.toLowerCase();
+        if (seenText.has(key)) return false;
+        seenText.add(key);
+        return true;
+    });
 
     const collectFromQuery = (result: any): any[] => {
         if (!result) return [];
@@ -274,28 +339,35 @@ function findApplicationCommand(channelId: string, name: string, type: number): 
         return [];
     };
 
+    const pick = (commands: any[]): any | undefined => {
+        const hit = commands.find(c => commandMatches(c, name, type));
+        return hit ? unwrapRootApplicationCommand(hit) : undefined;
+    };
+
     for (const context of contexts) {
-        try {
-            const queried =
-                ApplicationCommandIndexStore.query?.(
-                    context,
-                    { text: name, commandTypes: [type], type },
-                    { limit: 50 }
-                ) ??
-                ApplicationCommandIndexStore.query?.(
-                    context,
-                    { text: name, commandTypes: [type] },
-                    { allowFetch: false }
-                ) ??
-                ApplicationCommandIndexStore.query?.(
-                    context,
-                    { text: name },
-                    { limit: 50 }
-                );
-            const hit = collectFromQuery(queried).find(c => commandMatches(c, name, type));
-            if (hit) return hit;
-        } catch {
-            /* try next context shape */
+        for (const text of queryTexts) {
+            try {
+                const queried =
+                    ApplicationCommandIndexStore.query?.(
+                        context,
+                        { text, commandTypes: [type], type },
+                        { limit: 50 }
+                    ) ??
+                    ApplicationCommandIndexStore.query?.(
+                        context,
+                        { text, commandTypes: [type] },
+                        { allowFetch: false }
+                    ) ??
+                    ApplicationCommandIndexStore.query?.(
+                        context,
+                        { text },
+                        { limit: 50 }
+                    );
+                const hit = pick(collectFromQuery(queried));
+                if (hit) return hit;
+            } catch {
+                /* try next */
+            }
         }
     }
 
@@ -338,7 +410,7 @@ function findApplicationCommand(channelId: string, name: string, type: number): 
         const flat = Array.isArray(commands)
             ? commands
             : Object.values(commands as Record<string, any>);
-        const hit = flat.find(c => commandMatches(c, name, type));
+        const hit = pick(flat);
         if (hit) return hit;
     }
 
@@ -348,12 +420,36 @@ function findApplicationCommand(channelId: string, name: string, type: number): 
     );
 }
 
+/** Subcommand / group names from the slash payload — Discord often indexes those leaves. */
+function subcommandQueryHints(options?: SlashOption[]): string[] {
+    if (!options?.length) return [];
+    const hints: string[] = [];
+    for (const opt of options) {
+        const isSub =
+            opt.type === OPTION_TYPE_SUB_COMMAND
+            || opt.type === OPTION_TYPE_SUB_COMMAND_GROUP
+            || (opt.type == null && !!opt.options?.length);
+        if (!isSub || !opt.name?.trim()) continue;
+        hints.push(opt.name.trim());
+        for (const child of opt.options ?? []) {
+            const childIsSub =
+                child.type === OPTION_TYPE_SUB_COMMAND
+                || (child.type == null && !!child.options?.length);
+            if (!childIsSub || !child.name?.trim()) continue;
+            hints.push(child.name.trim());
+            hints.push(`${opt.name.trim()} ${child.name.trim()}`);
+        }
+    }
+    return hints;
+}
+
 /** Ask Discord to fetch the command index (same path the slash menu uses). Best-effort. */
 async function tryWarmCommandIndex(
     channelId: string,
     name: string,
     type: number,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    queryHints: string[] = []
 ): Promise<void> {
     const channel = ChannelStore.getChannel(channelId);
     if (!channel) return;
@@ -362,23 +458,37 @@ async function tryWarmCommandIndex(
         { channel, type: 0 },
         { channelId, guildId: channel.guild_id },
     ];
-    const filters = { text: name, commandTypes: [type] };
-    const options = { allowFetch: true, placeholderCount: 0, allowEmptySections: true };
+    const texts = [
+        name,
+        ...queryHints,
+        ...queryHints.map(h => `${name} ${h}`),
+    ];
+    const seen = new Set<string>();
+    const queryTexts = texts.map(t => t.trim()).filter(t => {
+        const key = t.toLowerCase();
+        if (!t || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+    const fetchOpts = { allowFetch: true, placeholderCount: 0, allowEmptySections: true };
 
     for (const context of contexts) {
-        if (signal?.aborted) throw new Error("cancelled");
-        try {
-            let result = ApplicationCommandIndexStore.query?.(context, filters, options);
-            // Discord fills the index asynchronously when allowFetch is true.
-            for (let i = 0; i < 25; i++) {
-                if (signal?.aborted) throw new Error("cancelled");
-                if (!result?.loading) break;
-                await new Promise(r => setTimeout(r, 120));
-                result = ApplicationCommandIndexStore.query?.(context, filters, options);
+        for (const text of queryTexts) {
+            if (signal?.aborted) throw new Error("cancelled");
+            try {
+                const filters = { text, commandTypes: [type] };
+                let result = ApplicationCommandIndexStore.query?.(context, filters, fetchOpts);
+                // Discord fills the index asynchronously when allowFetch is true.
+                for (let i = 0; i < 25; i++) {
+                    if (signal?.aborted) throw new Error("cancelled");
+                    if (!result?.loading) break;
+                    await new Promise(r => setTimeout(r, 120));
+                    result = ApplicationCommandIndexStore.query?.(context, filters, fetchOpts);
+                }
+            } catch (err: any) {
+                if (String(err?.message || err) === "cancelled") throw err;
+                /* try next */
             }
-        } catch (err: any) {
-            if (String(err?.message || err) === "cancelled") throw err;
-            /* try next context */
         }
     }
     // Some builds never expose `.loading`; give the fetch a short settle window.
@@ -391,14 +501,15 @@ async function ensureApplicationCommand(
     channelId: string,
     name: string,
     type: number,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    queryHints: string[] = []
 ): Promise<any> {
     try {
-        return findApplicationCommand(channelId, name, type);
+        return findApplicationCommand(channelId, name, type, queryHints);
     } catch (first) {
-        await tryWarmCommandIndex(channelId, name, type, signal);
+        await tryWarmCommandIndex(channelId, name, type, signal, queryHints);
         try {
-            return findApplicationCommand(channelId, name, type);
+            return findApplicationCommand(channelId, name, type, queryHints);
         } catch {
             throw first instanceof Error ? first : new Error(String(first));
         }
@@ -478,25 +589,32 @@ function eventNonce(event: any): string {
 
 function flattenButtons(message: any): FlattenedButton[] {
     const out: FlattenedButton[] = [];
-    const rows = message?.components;
-    if (!Array.isArray(rows)) return out;
-    for (const row of rows) {
-        const kids = row?.components ?? (row?.type === COMPONENT_TYPE_BUTTON ? [row] : []);
-        if (!Array.isArray(kids)) continue;
-        for (const c of kids) {
-            if (c == null) continue;
-            const type = Number(c.type ?? c.componentType);
-            if (type !== COMPONENT_TYPE_BUTTON) continue;
-            const label = String(c.label ?? "").trim();
-            const customId = String(c.custom_id ?? c.customId ?? "").trim();
-            if (!label || !customId) continue;
-            out.push({
-                label,
-                customId,
-                style: c.style != null ? Number(c.style) : undefined,
-            });
+
+    const visit = (node: any): void => {
+        if (node == null) return;
+        if (Array.isArray(node)) {
+            for (const child of node) visit(child);
+            return;
         }
-    }
+        const type = Number(node.type ?? node.componentType);
+        if (type === COMPONENT_TYPE_BUTTON) {
+            const label = String(node.label ?? "").trim();
+            const customId = String(node.custom_id ?? node.customId ?? "").trim();
+            if (label && customId) {
+                out.push({
+                    label,
+                    customId,
+                    style: node.style != null ? Number(node.style) : undefined,
+                });
+            }
+            return;
+        }
+        // ACTION_ROW / containers / sections — walk children.
+        if (Array.isArray(node.components)) visit(node.components);
+        if (Array.isArray(node.children)) visit(node.children);
+    };
+
+    visit(message?.components);
     return out;
 }
 
@@ -730,14 +848,19 @@ function waitForInteractionMessage(
         applicationId?: string;
         signal?: AbortSignal;
         timeoutMs?: number;
+        /** When true (default), wait for buttons on ephemeral replies (Ashen edits them in). */
+        requireButtons?: boolean;
     }
 ): Promise<any> {
     // Process /prep confirm UIs can take a few seconds; ephemerals do have ids.
     const timeoutMs = Math.max(500, opts.timeoutMs ?? 15000);
+    const requireButtons = opts.requireButtons !== false;
     const startedAtMs = Date.now();
     const matchOpts = { ...opts, startedAtMs };
     return new Promise((resolve, reject) => {
         let settled = false;
+        // Ephemeral create often lands without buttons; Ashen edits Confirm/Cancel in.
+        let pendingWithoutButtons: any = null;
         // INTERACTION_SUCCESS often carries the ephemeral before MESSAGE_CREATE.
         const types = [
             "MESSAGE_CREATE",
@@ -758,11 +881,26 @@ function waitForInteractionMessage(
             clearInterval(poll);
         };
 
-        const tryResolve = (message: any) => {
+        const finish = (message: any) => {
             if (settled) return;
-            if (!messageMatchesInteractionWait(message, matchOpts)) return;
             cleanup();
             resolve(message);
+        };
+
+        const tryResolve = (message: any) => {
+            if (settled || !message?.id) return;
+            if (!messageMatchesInteractionWait(message, matchOpts)) return;
+
+            const buttons = flattenButtons(message);
+            if (requireButtons && buttons.length === 0) {
+                // Keep waiting for MESSAGE_UPDATE that adds action rows.
+                pendingWithoutButtons = message;
+                rememberInteractionReply(
+                    summarizeInteractionMessage(message, opts.channelId, opts.applicationId)
+                );
+                return;
+            }
+            finish(message);
         };
 
         const scanStore = () => {
@@ -770,10 +908,27 @@ function waitForInteractionMessage(
                 tryResolve(msg);
                 if (settled) return;
             }
+            if (pendingWithoutButtons?.id) {
+                const mid = String(pendingWithoutButtons.id);
+                try {
+                    const fresh = MessageStore.getMessage(opts.channelId, mid);
+                    if (fresh) tryResolve(fresh);
+                } catch { /* ignore */ }
+            }
         };
 
         const onEvent = (event: any) => {
-            tryResolve(messageFromCreateEvent(event));
+            const message = messageFromCreateEvent(event);
+            if (
+                pendingWithoutButtons?.id
+                && message?.id
+                && String(message.id) === String(pendingWithoutButtons.id)
+            ) {
+                // MESSAGE_UPDATE may be sparse — keep create fields, overlay update.
+                tryResolve({ ...pendingWithoutButtons, ...message });
+                return;
+            }
+            tryResolve(message);
         };
 
         const onAbort = () => {
@@ -790,6 +945,12 @@ function waitForInteractionMessage(
         const timer = setTimeout(() => {
             scanStore();
             if (settled) return;
+            // Prefer the pending ephemeral even without buttons over a hard timeout
+            // with nothing — caller may still click after a short follow-up wait.
+            if (pendingWithoutButtons?.id) {
+                finish(pendingWithoutButtons);
+                return;
+            }
             cleanup();
             const recent = channelMessagesNewestFirst(opts.channelId).slice(0, 8).map(m => ({
                 id: m?.id,
@@ -848,6 +1009,81 @@ async function submitMessageComponent(opts: {
     await postApplicationCommand(body);
 }
 
+async function waitForButtonLabelOnMessage(opts: {
+    channelId: string;
+    messageId: string;
+    label: string;
+    timeoutMs?: number;
+}): Promise<any | null> {
+    const want = opts.label.trim();
+    const timeoutMs = Math.max(200, opts.timeoutMs ?? 8000);
+    const started = Date.now();
+
+    const read = (): any | null => {
+        try {
+            const msg = MessageStore.getMessage(opts.channelId, opts.messageId);
+            if (msg && flattenButtons(msg).some(b => b.label === want)) return msg;
+        } catch { /* ignore */ }
+        if (
+            lastInteractionReply?.messageId === opts.messageId
+            && lastInteractionReply.channelId === opts.channelId
+            && lastInteractionReply.buttons.some(b => b.label === want)
+        ) {
+            return {
+                id: lastInteractionReply.messageId,
+                channel_id: opts.channelId,
+                flags: lastInteractionReply.flags,
+                application_id: lastInteractionReply.applicationId,
+                components: [
+                    {
+                        type: 1,
+                        components: lastInteractionReply.buttons.map(b => ({
+                            type: COMPONENT_TYPE_BUTTON,
+                            label: b.label,
+                            custom_id: b.customId,
+                            style: b.style,
+                        })),
+                    },
+                ],
+            };
+        }
+        return null;
+    };
+
+    const immediate = read();
+    if (immediate) return immediate;
+
+    return new Promise(resolve => {
+        let settled = false;
+        const done = (msg: any | null) => {
+            if (settled) return;
+            settled = true;
+            try {
+                FluxDispatcher.unsubscribe("MESSAGE_UPDATE", onUpdate);
+            } catch { /* ignore */ }
+            clearInterval(poll);
+            clearTimeout(timer);
+            resolve(msg);
+        };
+        const onUpdate = (event: any) => {
+            const message = messageFromCreateEvent(event);
+            if (!message?.id || String(message.id) !== opts.messageId) return;
+            if (flattenButtons(message).some(b => b.label === want)) {
+                rememberInteractionReply(
+                    summarizeInteractionMessage(message, opts.channelId)
+                );
+                done(message);
+            }
+        };
+        const poll = setInterval(() => {
+            const hit = read();
+            if (hit) done(hit);
+        }, 150);
+        const timer = setTimeout(() => done(null), Math.max(0, timeoutMs - (Date.now() - started)));
+        FluxDispatcher.subscribe("MESSAGE_UPDATE", onUpdate);
+    });
+}
+
 async function clickButtonByLabel(opts: {
     channelId: string;
     messageId?: string;
@@ -856,7 +1092,36 @@ async function clickButtonByLabel(opts: {
 }): Promise<Record<string, unknown>> {
     const want = opts.label.trim();
     const preferred = String(opts.messageId || "").trim() || undefined;
-    const found = findMessageWithButtonLabel(opts.channelId, want, preferred);
+    let found = findMessageWithButtonLabel(opts.channelId, want, preferred);
+
+    // Ashen often creates the ephemeral empty, then edits Confirm/Cancel in.
+    if (!found && preferred) {
+        const waited = await waitForButtonLabelOnMessage({
+            channelId: opts.channelId,
+            messageId: preferred,
+            label: want,
+            timeoutMs: 8000,
+        });
+        if (waited) {
+            found = { message: waited, resolvedFrom: "messageId" };
+        }
+    } else if (
+        !found
+        && lastInteractionReply
+        && lastInteractionReply.channelId === opts.channelId
+        && lastInteractionReply.messageId
+    ) {
+        const waited = await waitForButtonLabelOnMessage({
+            channelId: opts.channelId,
+            messageId: lastInteractionReply.messageId,
+            label: want,
+            timeoutMs: 8000,
+        });
+        if (waited) {
+            found = { message: waited, resolvedFrom: "lastInteraction" };
+        }
+    }
+
     if (!found) {
         const hint = lastInteractionReply
             ? ` Last slash reply was ${lastInteractionReply.messageId} ` +
@@ -987,13 +1252,38 @@ function pickAutocompleteChoice(
         if (exactValue) return exactValue;
         const exactName = choices.find(c => c.name.toLowerCase() === q);
         if (exactName) return exactName;
-        const containing = choices.filter(
-            c => c.name.toLowerCase().includes(q) || String(c.value).toLowerCase().includes(q)
-        );
+        // Prefer longest name containment (e.g. query "Ships requiring crew queue message"
+        // vs short labels like "Ships full").
+        const containing = choices
+            .filter(
+                c =>
+                    c.name.toLowerCase().includes(q)
+                    || q.includes(c.name.toLowerCase())
+                    || String(c.value).toLowerCase().includes(q)
+            )
+            .sort((a, b) => b.name.length - a.name.length);
         if (containing.length) return containing[0];
     }
     // Tab in Discord typically selects the first suggestion.
     return choices[0];
+}
+
+function wrapOptionsInPath(
+    path: Array<{ name: string; type?: number }>,
+    leafOptions: any[]
+): any[] {
+    let current = leafOptions;
+    for (let i = path.length - 1; i >= 0; i--) {
+        const parent = path[i];
+        current = [
+            {
+                type: parent.type ?? OPTION_TYPE_SUB_COMMAND,
+                name: parent.name,
+                options: current,
+            },
+        ];
+    }
+    return current;
 }
 
 async function fetchAutocompleteChoices(opts: {
@@ -1003,14 +1293,20 @@ async function fetchAutocompleteChoices(opts: {
     optionName: string;
     query: string;
     otherOptions?: SlashOption[];
+    /** Parent SUB_COMMAND / GROUP path from the root (e.g. ``[{name:"recall"}]``). */
+    optionPath?: Array<{ name: string; type?: number }>;
+    /** Full root command options schema (for typing siblings at nested levels). */
+    rootCommand?: any;
     signal?: AbortSignal;
     choiceIndex?: number;
 }): Promise<{ choices: AutocompleteChoice[]; picked: AutocompleteChoice; commandId: string; }> {
+    const pathHints = (opts.optionPath ?? []).map(p => p.name);
     const cmd = await ensureApplicationCommand(
         opts.channelId,
         opts.commandName,
         COMMAND_TYPE_CHAT_INPUT,
-        opts.signal
+        opts.signal,
+        [...pathHints, ...subcommandQueryHints(opts.otherOptions)]
     );
     const applicationCommand = sanitizeApplicationCommand(cmd);
     const applicationId = String(
@@ -1026,22 +1322,29 @@ async function fetchAutocompleteChoices(opts: {
         throw new Error("Resolved command is missing application_id or id");
     }
 
-    const schema: any[] = cmd?.options ?? [];
-    const focusedDef = schema.find((o: any) => o.name === opts.optionName);
+    // Walk root schema along optionPath to the focused option's parent.
+    let levelSchema: any[] = cmd?.options ?? [];
+    for (const segment of opts.optionPath ?? []) {
+        const parentDef = levelSchema.find((o: any) => o.name === segment.name);
+        levelSchema = parentDef?.options ?? [];
+    }
+    const focusedDef = levelSchema.find((o: any) => o.name === opts.optionName);
     const focusedType = focusedDef?.type ?? OPTION_TYPE_STRING;
 
-    const optionPayload: any[] = [];
+    const siblingSchemaCmd = { options: levelSchema };
+    const leafPayload: any[] = [];
     for (const opt of opts.otherOptions ?? []) {
         if (opt.name === opts.optionName) continue;
-        const built = buildOptions([opt], cmd);
-        if (built?.[0]) optionPayload.push(built[0]);
+        const built = buildOptions([opt], siblingSchemaCmd);
+        if (built?.[0]) leafPayload.push(built[0]);
     }
-    optionPayload.push({
+    leafPayload.push({
         type: focusedType,
         name: opts.optionName,
         value: opts.query,
         focused: true,
     });
+    const optionPayload = wrapOptionsInPath(opts.optionPath ?? [], leafPayload);
 
     const guildId = getGuildId(opts.channelId, opts.guildId);
     const integrationType = pickIntegrationType(cmd, guildId);
@@ -1055,7 +1358,7 @@ async function fetchAutocompleteChoices(opts: {
     applicationCommand.application_id = applicationId;
     applicationCommand.type = COMMAND_TYPE_CHAT_INPUT;
     if (version != null) applicationCommand.version = version;
-    if (applicationCommand.name == null) applicationCommand.name = cmd.name ?? opts.commandName;
+    applicationCommand.name = opts.commandName;
 
     const body: Record<string, unknown> = {
         type: INTERACTION_APPLICATION_COMMAND_AUTOCOMPLETE,
@@ -1069,7 +1372,7 @@ async function fetchAutocompleteChoices(opts: {
         data: {
             version,
             id: commandId,
-            name: applicationCommand.name ?? opts.commandName,
+            name: opts.commandName,
             type: COMMAND_TYPE_CHAT_INPUT,
             options: optionPayload,
             application_command: applicationCommand,
@@ -1099,7 +1402,8 @@ async function resolveSlashOptions(
     cmd: any,
     options: SlashOption[] | undefined,
     signal?: AbortSignal,
-    choiceIndex?: number
+    choiceIndex?: number,
+    optionPath: Array<{ name: string; type?: number }> = []
 ): Promise<{ options: SlashOption[]; resolutions: Record<string, AutocompleteChoice>; }> {
     const built = buildOptions(options, cmd) ?? [];
     if (!built.length) return { options: [], resolutions: {} };
@@ -1125,7 +1429,14 @@ async function resolveSlashOptions(
                 { options: def?.options ?? [] },
                 nestedIn,
                 signal,
-                choiceIndex
+                choiceIndex,
+                [
+                    ...optionPath,
+                    {
+                        name: opt.name,
+                        type: opt.type ?? OPTION_TYPE_SUB_COMMAND,
+                    },
+                ]
             );
             Object.assign(resolutions, nested.resolutions);
             out.push({
@@ -1152,11 +1463,13 @@ async function resolveSlashOptions(
             optionName: opt.name,
             query: String(opt.value ?? ""),
             otherOptions: options?.filter(o => o.name !== opt.name),
+            optionPath,
             signal,
             choiceIndex,
         });
         resolutions[opt.name] = picked;
-        out.push({ name: opt.name, type: opt.type, value: picked.value });
+        // Discord STRING options must be strings — choice values may be numbers.
+        out.push({ name: opt.name, type: opt.type, value: String(picked.value) });
     }
 
     return { options: out, resolutions };
@@ -1174,11 +1487,13 @@ async function submitApplicationCommand(opts: {
     waitForResponse?: boolean;
     waitMs?: number;
 }): Promise<Record<string, unknown>> {
+    const queryHints = subcommandQueryHints(opts.options);
     const cmd = await ensureApplicationCommand(
         opts.channelId,
         opts.name,
         opts.commandType,
-        opts.signal
+        opts.signal,
+        queryHints
     );
     const applicationCommand = sanitizeApplicationCommand(cmd);
     const applicationId = String(
@@ -1220,12 +1535,13 @@ async function submitApplicationCommand(opts: {
     applicationCommand.application_id = applicationId;
     applicationCommand.type = opts.commandType;
     if (version != null) applicationCommand.version = version;
-    if (applicationCommand.name == null) applicationCommand.name = cmd.name ?? opts.name;
+    // Always use the requested root name (index may have matched a subcommand leaf).
+    applicationCommand.name = opts.name;
 
     const data: Record<string, unknown> = {
         version,
         id: commandId,
-        name: applicationCommand.name ?? opts.name,
+        name: opts.name,
         type: opts.commandType,
         options: options ?? [],
         application_command: applicationCommand,
@@ -1315,7 +1631,7 @@ export async function handleAction(
                     await new Promise(r => setTimeout(r, Math.min(step, end - Date.now())));
                 }
             }
-            return { pong: true, delayMs, version: "2026.33.1", plugin: "AshenMacrosBridge" };
+            return { pong: true, delayMs, version: "2026.33.4", plugin: "AshenMacrosBridge" };
         }
 
         case "react": {
