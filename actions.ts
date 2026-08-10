@@ -65,8 +65,85 @@ function asErrorMessage(err: unknown): string {
     if (err == null) return "Unknown error";
     if (typeof err === "string") return err;
     if (err instanceof Error) return err.message || String(err);
-    const anyErr = err as { message?: string; body?: { message?: string; }; };
-    return anyErr.body?.message || anyErr.message || String(err);
+    const anyErr = err as {
+        message?: string;
+        body?: { message?: string; code?: number; errors?: unknown; };
+        data?: { message?: string; code?: number; };
+    };
+    const body = anyErr.body ?? anyErr.data;
+    if (body && typeof body === "object") {
+        const msg = body.message || anyErr.message;
+        if (msg && body.code != null) return `${msg} (${body.code})`;
+        if (msg) return String(msg);
+    }
+    return anyErr.message || String(err);
+}
+
+function isUnknownIntegrationError(err: unknown): boolean {
+    const text = asErrorMessage(err).toLowerCase();
+    return text.includes("unknown integration") || text.includes("(10005)");
+}
+
+function normalizeIntegrationTypes(raw: unknown): number[] {
+    if (raw == null) return [];
+    if (typeof raw === "number" && Number.isFinite(raw)) return [raw];
+    if (Array.isArray(raw)) {
+        return raw
+            .map(v => Number(v))
+            .filter(n => Number.isFinite(n));
+    }
+    if (typeof raw === "object") {
+        // Discord sometimes stores { "0": true, "1": true } or a Set-like map.
+        const out: number[] = [];
+        for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+            if (v === false || v == null) continue;
+            const n = Number(k);
+            if (Number.isFinite(n)) out.push(n);
+        }
+        return out;
+    }
+    return [];
+}
+
+function resolveApplicationId(cmd: any): string {
+    return String(
+        cmd?.application_id
+        ?? cmd?.applicationId
+        ?? cmd?.application?.id
+        ?? cmd?.application?.application_id
+        ?? ""
+    ).trim();
+}
+
+function pickIntegrationType(cmd: any, guildId?: string): number {
+    const explicit = cmd?.integration_type ?? cmd?.integrationType;
+    if (explicit === 0 || explicit === 1 || explicit === "0" || explicit === "1") {
+        return Number(explicit);
+    }
+    const types = normalizeIntegrationTypes(
+        cmd?.integration_types
+        ?? cmd?.integrationTypes
+        ?? cmd?.application?.integration_types
+        ?? cmd?.application?.integrationTypes
+    );
+    if (types.length) {
+        if (guildId != null && types.includes(INTEGRATION_TYPE_GUILD)) {
+            return INTEGRATION_TYPE_GUILD;
+        }
+        if (types.includes(INTEGRATION_TYPE_USER)) return INTEGRATION_TYPE_USER;
+        if (guildId != null && types.includes(INTEGRATION_TYPE_USER)) {
+            // User-installed app used inside a guild.
+            return INTEGRATION_TYPE_USER;
+        }
+        return Number(types[0]);
+    }
+    return guildId != null ? INTEGRATION_TYPE_GUILD : INTEGRATION_TYPE_USER;
+}
+
+function alternateIntegrationType(type: number): number {
+    return type === INTEGRATION_TYPE_GUILD
+        ? INTEGRATION_TYPE_USER
+        : INTEGRATION_TYPE_GUILD;
 }
 
 function normalizeEmoji(emoji: EmojiRef | string | undefined): { name: string; id?: string | null; animated?: boolean; } {
@@ -153,13 +230,15 @@ function sanitizeApplicationCommand(cmd: any): Record<string, unknown> {
 
     const out: Record<string, unknown> = {};
     const id = get("id");
-    const applicationId = get("application_id", "applicationId");
+    const applicationId = resolveApplicationId(raw) || get("application_id", "applicationId");
     const version = get("version");
     const type = get("type", "inputType");
     const name = get("name", "displayName");
     const description = get("description");
     const options = get("options");
-    const integrationTypes = get("integration_types", "integrationTypes");
+    const integrationTypes = normalizeIntegrationTypes(
+        get("integration_types", "integrationTypes")
+    );
     const contexts = get("contexts");
     const guildId = get("guild_id", "guildId");
     const dmPermission = get("dm_permission", "dmPermission");
@@ -167,32 +246,19 @@ function sanitizeApplicationCommand(cmd: any): Record<string, unknown> {
     const nsfw = get("nsfw");
 
     if (id != null) out.id = String(id);
-    if (applicationId != null) out.application_id = String(applicationId);
+    if (applicationId) out.application_id = String(applicationId);
     if (version != null) out.version = String(version);
     if (type != null) out.type = type;
     if (name != null) out.name = name;
     if (description != null) out.description = description;
     if (options != null) out.options = options;
-    if (integrationTypes != null) out.integration_types = integrationTypes;
+    if (integrationTypes.length) out.integration_types = integrationTypes;
     if (contexts !== undefined) out.contexts = contexts;
     if (guildId != null) out.guild_id = String(guildId);
     if (dmPermission != null) out.dm_permission = dmPermission;
     if (defaultMemberPermissions !== undefined) out.default_member_permissions = defaultMemberPermissions;
     if (nsfw != null) out.nsfw = nsfw;
     return out;
-}
-
-function pickIntegrationType(cmd: any, guildId?: string): number {
-    const types: number[] | undefined =
-        cmd?.integration_types ??
-        cmd?.integrationTypes ??
-        undefined;
-    if (Array.isArray(types) && types.length) {
-        if (guildId != null && types.includes(INTEGRATION_TYPE_GUILD)) return INTEGRATION_TYPE_GUILD;
-        if (types.includes(INTEGRATION_TYPE_USER)) return INTEGRATION_TYPE_USER;
-        return Number(types[0]);
-    }
-    return guildId != null ? INTEGRATION_TYPE_GUILD : INTEGRATION_TYPE_USER;
 }
 
 function messageResolvedPayload(channelId: string, messageId: string): Record<string, unknown> | undefined {
@@ -558,8 +624,26 @@ async function postApplicationCommand(body: Record<string, unknown>): Promise<vo
     const status = res?.status ?? res?.statusCode;
     if (status != null && status >= 400) {
         throw new Error(
-            asErrorMessage(res?.body) || `interactions HTTP ${status}`
+            asErrorMessage(res?.body ?? res) || `interactions HTTP ${status}`
         );
+    }
+}
+
+/** Post an interaction; on Unknown Integration flip guild/user install and retry once. */
+async function postApplicationCommandWithIntegrationFallback(
+    body: Record<string, unknown>
+): Promise<number> {
+    const firstType = Number(body.integration_type);
+    try {
+        await postApplicationCommand(body);
+        return firstType;
+    } catch (err) {
+        if (!isUnknownIntegrationError(err) || !Number.isFinite(firstType)) throw err;
+        const alt = alternateIntegrationType(firstType);
+        const retry = { ...body, integration_type: alt };
+        await postApplicationCommand(retry);
+        body.integration_type = alt;
+        return alt;
     }
 }
 
@@ -1310,7 +1394,7 @@ async function fetchAutocompleteChoices(opts: {
     );
     const applicationCommand = sanitizeApplicationCommand(cmd);
     const applicationId = String(
-        applicationCommand.application_id ?? cmd.application_id ?? cmd.applicationId ?? ""
+        applicationCommand.application_id || resolveApplicationId(cmd) || ""
     );
     const commandId = String(applicationCommand.id ?? cmd.id ?? "");
     const version = applicationCommand.version != null
@@ -1383,7 +1467,7 @@ async function fetchAutocompleteChoices(opts: {
 
     const pending = waitForAutocompleteChoices(nonce, localAbort.signal);
     try {
-        await postApplicationCommand(body);
+        await postApplicationCommandWithIntegrationFallback(body);
         const choices = await pending;
         const picked = pickAutocompleteChoice(choices, opts.query, opts.choiceIndex);
         return { choices, picked, commandId };
@@ -1497,7 +1581,7 @@ async function submitApplicationCommand(opts: {
     );
     const applicationCommand = sanitizeApplicationCommand(cmd);
     const applicationId = String(
-        applicationCommand.application_id ?? cmd.application_id ?? cmd.applicationId ?? ""
+        applicationCommand.application_id || resolveApplicationId(cmd) || ""
     );
     const commandId = String(applicationCommand.id ?? cmd.id ?? "");
     const version = applicationCommand.version != null
@@ -1511,7 +1595,7 @@ async function submitApplicationCommand(opts: {
 
     const guildId = getGuildId(opts.channelId, opts.guildId);
     const sessionId = getSessionId();
-    const integrationType = pickIntegrationType(cmd, guildId);
+    let integrationType = pickIntegrationType(cmd, guildId);
 
     let resolvedOptions = opts.options;
     let resolutions: Record<string, AutocompleteChoice> = {};
@@ -1586,7 +1670,7 @@ async function submitApplicationCommand(opts: {
     }
 
     try {
-        await postApplicationCommand(body);
+        integrationType = await postApplicationCommandWithIntegrationFallback(body);
         const meta: Record<string, unknown> = {
             applicationId,
             commandId,
@@ -1631,7 +1715,7 @@ export async function handleAction(
                     await new Promise(r => setTimeout(r, Math.min(step, end - Date.now())));
                 }
             }
-            return { pong: true, delayMs, version: "2026.33.4", plugin: "AshenMacrosBridge" };
+            return { pong: true, delayMs, version: "2026.33.5", plugin: "AshenMacrosBridge" };
         }
 
         case "react": {

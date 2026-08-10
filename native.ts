@@ -13,7 +13,7 @@ const HOST = "127.0.0.1";
 /** Keep in sync with package.json — shown in Ashen Macros hub Bridge status.
  *  Must NOT be exported: Vencord registers every native export as ipcMain.handle().
  */
-const BRIDGE_VERSION = "2026.33.4";
+const BRIDGE_VERSION = "2026.33.5";
 
 let httpServer: Server | null = null;
 let authToken = "";
