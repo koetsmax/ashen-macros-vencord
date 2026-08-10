@@ -41,7 +41,7 @@ Folder name can be `ashenMacrosBridge` or similar; Vencord loads any `userplugin
 On connect the plugin sends:
 
 ```json
-{ "type": "hello", "needsAuth": true, "plugin": "AshenMacrosBridge", "version": "0.1.0" }
+{ "type": "hello", "needsAuth": true, "plugin": "AshenMacrosBridge", "version": "2026.33.1" }
 ```
 
 (`needsAuth` is `false` if the query token already matched.)
@@ -61,7 +61,8 @@ On connect the plugin sends:
 | `send` | `channelId`, `content` | `MessageActions.sendMessage` |
 | `switchChannel` | `channelId`, optional `guildId` | `ChannelRouter.transitionToChannel` |
 | `messageCommand` | `channelId`, `messageId`, optional `name` (default `"update bonus"`), optional `guildId` | MESSAGE context command via index + `POST /interactions` |
-| `slashCommand` | `channelId`, `name`, optional `options: [{ name, type?, value?, options?, autocomplete? }]`, optional `guildId` | CHAT_INPUT slash via same `/interactions` path; options with bot-side autocomplete are resolved automatically. Nested `options` are used for SUB_COMMAND (type 1) |
+| `slashCommand` | `channelId`, `name`, optional `options`, `guildId`, optional `waitForResponse` / `waitMs` | CHAT_INPUT slash via `/interactions`. When `waitForResponse` is true, waits for the ephemeral reply (with buttons) and returns `messageId`, `flags`, `buttons` |
+| `clickButton` | `channelId`, `label`, optional `messageId`, optional `guildId` | MESSAGE_COMPONENT (type 3) click; resolves `custom_id` from the button label. `messageId` optional — uses the last `slashCommand`+`waitForResponse` ephemeral (Discord has no Copy ID on ephemerals) |
 | `autocomplete` | `channelId`, `name`, `optionName`, `query`, optional `options`, `guildId`, `choiceIndex` | Fetch slash-option choices (display name → value) without submitting |
 
 ### Slash option `type`
@@ -72,10 +73,10 @@ Discord application-command option types (the Bridge tests “type” spinbox):
 |---:|---|---|---|
 | 1 | `SUB_COMMAND` | nested options | Subcommand under a group |
 | 2 | `SUB_COMMAND_GROUP` | nested subcommands | Group of subcommands |
-| 3 | `STRING` | string | Free text; **also** Ashen autocomplete options (`target`, `ship`) — query in, UUID/value out |
+| 3 | `STRING` | string | Free text; **also** Ashen autocomplete options (`target`/`member`, `ship`) — query in, UUID/value out |
 | 4 | `INTEGER` | integer | Whole numbers |
 | 5 | `BOOLEAN` | `true` / `false` | Flags (e.g. unprep) |
-| 6 | `USER` | snowflake user id | Discord user picker (not Ashen prep/process `target`) |
+| 6 | `USER` | snowflake user id | Discord user picker (not Ashen prep `target` / process `member`) |
 | 7 | `CHANNEL` | snowflake channel id | Channel picker |
 | 8 | `ROLE` | snowflake role id | Role picker |
 | 9 | `MENTIONABLE` | user or role snowflake | User or role |
@@ -95,9 +96,12 @@ For `/prep` and `/process`, use **type 3** (`STRING`) with the value you would t
 { "id": "6", "type": "switchChannel", "channelId": "…" }
 { "id": "7", "type": "messageCommand", "name": "update bonus", "channelId": "…", "messageId": "…" }
 { "id": "8", "type": "slashCommand", "name": "prep", "channelId": "…", "options": [{ "name": "target", "type": 3, "value": "123456789012345678", "autocomplete": true }] }
-{ "id": "9", "type": "slashCommand", "name": "process", "channelId": "…", "options": [{ "name": "target", "type": 3, "value": "123…", "autocomplete": true }, { "name": "ship", "type": 3, "value": "1 5", "autocomplete": true }] }
+{ "id": "9", "type": "slashCommand", "name": "process", "channelId": "…", "waitForResponse": true, "options": [{ "name": "member", "type": 3, "value": "123…", "autocomplete": true }, { "name": "ship", "type": 3, "value": "1 5", "autocomplete": true }] }
 { "id": "9b", "type": "slashCommand", "name": "message-store", "channelId": "…", "options": [{ "name": "recall", "type": 1, "options": [{ "name": "name", "type": 3, "value": "Ships full" }] }] }
+{ "id": "9c", "type": "clickButton", "channelId": "…", "label": "Confirm" }
+{ "id": "9d", "type": "clickButton", "channelId": "…", "messageId": "…", "label": "Confirm" }
 { "id": "10", "type": "autocomplete", "name": "prep", "channelId": "…", "optionName": "target", "query": "123456789012345678" }
+{ "id": "10b", "type": "autocomplete", "name": "process", "channelId": "…", "optionName": "member", "query": "123456789012345678" }
 { "id": "11", "type": "cancel", "targetId": "8" }
 ```
 
@@ -114,7 +118,7 @@ Renderer cannot open a listening socket (browser WebSocket is client-only), so t
 
 ## Caveats
 
-- **`messageCommand` / `slashCommand`** use Discord’s undocumented client `POST /interactions` path. Command `id`/`version` come from `ApplicationCommandIndexStore`; if lookup fails, open slash/Apps once in that channel to warm the index, then retry.
+- **`messageCommand` / `slashCommand`** use Discord’s undocumented client `POST /interactions` path. Command `id`/`version` come from `ApplicationCommandIndexStore`. On a miss the plugin tries `query(..., { allowFetch: true })` once; if that still fails, open slash/Apps once in that channel (Discord’s reliable warm path), then retry. Ashen Macros shows a toast when this happens.
 - Interaction body shape can drift with Discord updates — capture a real Network-tab `interactions` payload if submits start failing.
 - `session_id` is resolved via webpack `getSessionId`; if that finder breaks after a Discord update, command actions will error until updated.
 - Cancel cannot unwind an HTTP call Discord already accepted; it stops applying/chaining the in-flight handler result.

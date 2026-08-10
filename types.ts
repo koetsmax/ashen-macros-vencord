@@ -13,7 +13,8 @@ export type BridgeActionType =
     | "switchChannel"
     | "messageCommand"
     | "slashCommand"
-    | "autocomplete";
+    | "autocomplete"
+    | "clickButton";
 
 export interface EmojiRef {
     name: string;
@@ -40,6 +41,12 @@ export interface AutocompleteChoice {
     value: string | number;
 }
 
+export interface FlattenedButton {
+    label: string;
+    customId: string;
+    style?: number;
+}
+
 /** Client → plugin */
 export interface BridgeRequest {
     id: string;
@@ -56,7 +63,7 @@ export interface BridgeRequest {
     /** Artificial delay (ms) before pong — used by Bridge tests Escape/cancel harness. */
     delayMs?: number;
 
-    // react / edit / send / switch / commands / autocomplete
+    // react / edit / send / switch / commands / autocomplete / clickButton
     channelId?: string;
     messageId?: string;
     guildId?: string;
@@ -72,6 +79,14 @@ export interface BridgeRequest {
     query?: string;
     /** Prefer this choice index after autocomplete (default: best match / first). */
     choiceIndex?: number;
+
+    // slashCommand — wait for ephemeral / interaction response message
+    waitForResponse?: boolean;
+    /** Timeout for waitForResponse (ms). Default 8000. */
+    waitMs?: number;
+
+    // clickButton — exact button label; messageId optional (last slash ephemeral)
+    label?: string;
 }
 
 /** Plugin → client */

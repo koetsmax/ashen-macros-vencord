@@ -10,6 +10,10 @@ import type { Duplex } from "net";
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const HOST = "127.0.0.1";
+/** Keep in sync with package.json — shown in Ashen Macros hub Bridge status.
+ *  Must NOT be exported: Vencord registers every native export as ipcMain.handle().
+ */
+const BRIDGE_VERSION = "2026.33.1";
 
 let httpServer: Server | null = null;
 let authToken = "";
@@ -201,7 +205,7 @@ function handleUpgrade(req: IncomingMessage, socket: Duplex, _head: Buffer) {
         type: "hello",
         needsAuth: !authenticated,
         plugin: "AshenMacrosBridge",
-        version: "0.1.0",
+        version: BRIDGE_VERSION,
     });
 
     let buffer = Buffer.alloc(0);
@@ -267,7 +271,13 @@ async function handleClientMessage(
     if (msg?.type === "auth") {
         if (tokensEqual(String(msg.token ?? ""), authToken)) {
             setAuthed(true);
-            sendJson(socket, { id, ok: true, authenticated: true });
+            sendJson(socket, {
+                id,
+                ok: true,
+                authenticated: true,
+                version: BRIDGE_VERSION,
+                plugin: "AshenMacrosBridge",
+            });
         } else {
             setAuthed(false);
             sendJson(socket, { id, ok: false, error: "Invalid auth token" });
