@@ -60,7 +60,7 @@ On connect the plugin sends:
 | `edit` | `channelId`, `messageId`, `content` | `MessageActions.editMessage` |
 | `send` | `channelId`, `content` | `MessageActions.sendMessage` |
 | `switchChannel` | `channelId`, optional `guildId` | `ChannelRouter.transitionToChannel` |
-| `messageCommand` | `channelId`, `messageId`, optional `name` (default `"update bonus"`), optional `guildId` | MESSAGE context command via index + `POST /interactions` |
+| `messageCommand` | `channelId`, `messageId`, optional `name` (default `"Update Bonus"`), optional `guildId` | MESSAGE context command via index + `POST /interactions` |
 | `slashCommand` | `channelId`, `name`, optional `options`, `guildId`, optional `waitForResponse` / `waitMs` | CHAT_INPUT slash via `/interactions`. When `waitForResponse` is true, waits for the ephemeral reply (with buttons) and returns `messageId`, `flags`, `buttons` |
 | `clickButton` | `channelId`, `label`, optional `messageId`, optional `guildId` | MESSAGE_COMPONENT (type 3) click; resolves `custom_id` from the button label. `messageId` optional — uses the last `slashCommand`+`waitForResponse` ephemeral (Discord has no Copy ID on ephemerals) |
 | `autocomplete` | `channelId`, `name`, `optionName`, `query`, optional `options`, `guildId`, `choiceIndex` | Fetch slash-option choices (display name → value) without submitting |
@@ -94,7 +94,7 @@ For `/prep` and `/process`, use **type 3** (`STRING`) with the value you would t
 { "id": "4", "type": "edit", "channelId": "…", "messageId": "…", "content": "~~old~~\nnew" }
 { "id": "5", "type": "send", "channelId": "…", "content": "hello" }
 { "id": "6", "type": "switchChannel", "channelId": "…" }
-{ "id": "7", "type": "messageCommand", "name": "update bonus", "channelId": "…", "messageId": "…" }
+{ "id": "7", "type": "messageCommand", "name": "Update Bonus", "channelId": "…", "messageId": "…" }
 { "id": "8", "type": "slashCommand", "name": "prep", "channelId": "…", "options": [{ "name": "target", "type": 3, "value": "123456789012345678", "autocomplete": true }] }
 { "id": "9", "type": "slashCommand", "name": "process", "channelId": "…", "waitForResponse": true, "options": [{ "name": "member", "type": 3, "value": "123…", "autocomplete": true }, { "name": "ship", "type": 3, "value": "1 5", "autocomplete": true }] }
 { "id": "9b", "type": "slashCommand", "name": "message-store", "channelId": "…", "options": [{ "name": "recall", "type": 1, "options": [{ "name": "name", "type": 3, "value": "Ships full" }] }] }

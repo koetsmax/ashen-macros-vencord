@@ -332,14 +332,62 @@ function commandLeafName(cmd: any): string {
     ).trim();
 }
 
+/** Apps menu / index names: collapse case and space/_/- so "update bonus" matches "Update Bonus". */
+function normalizeCommandName(name: string): string {
+    return String(name || "").trim().toLowerCase().replace(/[\s_-]+/g, " ");
+}
+
+function titleCaseCommandName(name: string): string {
+    return String(name || "")
+        .trim()
+        .split(/[\s_-]+/)
+        .filter(Boolean)
+        .map(part => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+        .join(" ");
+}
+
+/** Query strings for ApplicationCommandIndexStore — Discord's filter is case-sensitive. */
+function commandQueryVariants(name: string, extra: string[] = []): string[] {
+    const trimmed = String(name || "").trim();
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const text of [trimmed, titleCaseCommandName(trimmed), trimmed.toLowerCase(), ...extra]) {
+        const t = String(text || "").trim();
+        if (!t || seen.has(t)) continue;
+        seen.add(t);
+        out.push(t);
+    }
+    return out;
+}
+
+function commandNameCandidates(cmd: any): string[] {
+    const root = cmd?.rootCommand ?? cmd?.root_command;
+    const bags = [cmd, root];
+    const out: string[] = [];
+    for (const bag of bags) {
+        if (!bag) continue;
+        for (const key of ["name", "displayName", "untranslatedName", "nameLocalized"]) {
+            const value = bag[key];
+            if (typeof value === "string" && value.trim()) out.push(value);
+            else if (value && typeof value === "object") {
+                for (const inner of Object.values(value)) {
+                    if (typeof inner === "string" && inner.trim()) out.push(inner);
+                }
+            }
+        }
+    }
+    return out;
+}
+
 function commandMatches(cmd: any, name: string, type: number): boolean {
     if (!cmd) return false;
-    const want = name.toLowerCase();
-    const leaf = commandLeafName(cmd).toLowerCase();
-    const root = commandRootName(cmd).toLowerCase();
+    const want = normalizeCommandName(name);
+    const names = commandNameCandidates(cmd).map(normalizeCommandName);
+    const leaf = normalizeCommandName(commandLeafName(cmd));
+    const root = normalizeCommandName(commandRootName(cmd));
     // Parent command, or indexed subcommand leaf whose root is the parent
     // (Discord indexes `/message-store recall` as name="recall" + rootCommand).
-    if (leaf !== want && root !== want) return false;
+    if (leaf !== want && root !== want && !names.includes(want)) return false;
     const t = cmd.type ?? cmd.inputType ?? cmd.rootCommand?.type ?? cmd.root_command?.type;
     // MESSAGE / USER context commands must match type exactly — a null type is not good enough.
     if (type === COMMAND_TYPE_MESSAGE || type === 2) {
@@ -390,22 +438,12 @@ function findApplicationCommand(
         channel,
     ];
 
-    const texts = [
-        name,
-        ...queryHints.map(h => h.trim()).filter(Boolean),
-        ...queryHints
-            .map(h => h.trim())
-            .filter(Boolean)
-            .map(h => `${name} ${h}`),
-    ];
-    // de-dupe while preserving order
-    const seenText = new Set<string>();
-    const queryTexts = texts.filter(t => {
-        const key = t.toLowerCase();
-        if (seenText.has(key)) return false;
-        seenText.add(key);
-        return true;
-    });
+    const hintTexts = queryHints.map(h => h.trim()).filter(Boolean);
+    const queryTexts = commandQueryVariants(name, [
+        ...hintTexts,
+        ...hintTexts.map(h => `${name} ${h}`),
+        ...hintTexts.map(h => `${titleCaseCommandName(name)} ${h}`),
+    ]);
 
     const collectFromQuery = (result: any): any[] => {
         if (!result) return [];
@@ -537,18 +575,12 @@ async function tryWarmCommandIndex(
         { channel, type: 0 },
         { channelId, guildId: channel.guild_id },
     ];
-    const texts = [
-        name,
-        ...queryHints,
-        ...queryHints.map(h => `${name} ${h}`),
-    ];
-    const seen = new Set<string>();
-    const queryTexts = texts.map(t => t.trim()).filter(t => {
-        const key = t.toLowerCase();
-        if (!t || seen.has(key)) return false;
-        seen.add(key);
-        return true;
-    });
+    const hintTexts = queryHints.map(h => String(h || "").trim()).filter(Boolean);
+    const queryTexts = commandQueryVariants(name, [
+        ...hintTexts,
+        ...hintTexts.map(h => `${name} ${h}`),
+        ...hintTexts.map(h => `${titleCaseCommandName(name)} ${h}`),
+    ]);
     const fetchOpts = { allowFetch: true, placeholderCount: 0, allowEmptySections: true };
 
     for (const context of contexts) {
@@ -1769,7 +1801,7 @@ export async function handleAction(
 
         case "messageCommand": {
             if (!req.channelId || !req.messageId) throw new Error("channelId and messageId are required");
-            const name = req.name?.trim() || "update bonus";
+            const name = req.name?.trim() || "Update Bonus";
             const meta = await submitApplicationCommand({
                 channelId: req.channelId,
                 guildId: req.guildId,
