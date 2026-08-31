@@ -1,10 +1,14 @@
 /*
  * Native (Electron main) WebSocket server for AshenMacrosBridge.
  * Binds 127.0.0.1 only. No npm deps — minimal RFC6455 text frames via Node http.
+ *
+ * Renderer traffic uses PluginNative IPC (dequeueRequest / completeRequest), not
+ * webContents.executeJavaScript — avoids compiling a new script per request and
+ * keeps idle connections off the Discord UI thread.
  */
 
 import { createHash, timingSafeEqual } from "crypto";
-import { BrowserWindow, IpcMainInvokeEvent } from "electron";
+import { IpcMainInvokeEvent } from "electron";
 import { createServer, IncomingMessage, Server } from "http";
 import type { Duplex } from "net";
 
@@ -13,11 +17,32 @@ const HOST = "127.0.0.1";
 /** Keep in sync with package.json — shown in Ashen Macros hub Bridge status.
  *  Must NOT be exported: Vencord registers every native export as ipcMain.handle().
  */
-const BRIDGE_VERSION = "2026.33.8";
+const BRIDGE_VERSION = "2026.36.0";
+
+const MAX_SOCKET_BUFFER = 1024 * 1024;
+const MAX_REQUEST_QUEUE = 32;
+const RENDERER_REPLY_TIMEOUT_MS = 180_000;
 
 let httpServer: Server | null = null;
 let authToken = "";
 const sockets = new Set<Duplex>();
+
+type DequeueWaiter = {
+    resolve: (req: unknown | null) => void;
+    timer: ReturnType<typeof setTimeout>;
+};
+
+type ReplyWaiter = {
+    resolve: (value: unknown) => void;
+    reject: (err: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+};
+
+/** WS → renderer: queued until the renderer pump dequeues. */
+const requestQueue: unknown[] = [];
+const dequeueWaiters: DequeueWaiter[] = [];
+/** id → promise waiting for renderer completeRequest. */
+const replyWaiters = new Map<string, ReplyWaiter>();
 
 function tokensEqual(a: string, b: string): boolean {
     if (!a || !b) return false;
@@ -126,42 +151,94 @@ function sendJson(socket: Duplex, obj: unknown) {
     }
 }
 
-function getDiscordWebContents() {
-    const windows = BrowserWindow.getAllWindows();
-    for (const win of windows) {
-        const wc = win.webContents;
-        if (wc && !wc.isDestroyed()) return wc;
+function wakeDequeueWaiters(value: unknown | null) {
+    while (dequeueWaiters.length) {
+        const w = dequeueWaiters.shift()!;
+        clearTimeout(w.timer);
+        w.resolve(value);
     }
-    return null;
 }
 
-async function invokeRenderer(request: unknown): Promise<unknown> {
-    const wc = getDiscordWebContents();
-    if (!wc) throw new Error("No Discord renderer window available");
-
-    const payload = JSON.stringify(request);
-    const responseStr = await wc.executeJavaScript(`
-        (async () => {
-            if (typeof window.__AshenMacrosBridgeHandle !== "function") {
-                return JSON.stringify({ ok: false, error: "Bridge handler not ready in renderer" });
-            }
-            try {
-                const response = await window.__AshenMacrosBridgeHandle(${payload});
-                return JSON.stringify(response ?? { ok: false, error: "Empty handler response" });
-            } catch (error) {
-                return JSON.stringify({
-                    ok: false,
-                    error: error && error.message ? error.message : String(error)
-                });
-            }
-        })()
-    `);
-
-    try {
-        return JSON.parse(responseStr);
-    } catch {
-        return { ok: false, error: "Invalid JSON from renderer handler" };
+function clearReplyWaiters(reason: string) {
+    for (const [, w] of replyWaiters) {
+        clearTimeout(w.timer);
+        w.reject(new Error(reason));
     }
+    replyWaiters.clear();
+}
+
+function clearRequestQueue() {
+    requestQueue.length = 0;
+    wakeDequeueWaiters(null);
+}
+
+/**
+ * Renderer pump: wait for the next WS request (or null on timeout / shutdown).
+ * Idle = one pending IPC promise in main — no Discord UI work.
+ */
+export async function dequeueRequest(
+    _event: IpcMainInvokeEvent,
+    timeoutMs = 30_000
+): Promise<unknown | null> {
+    if (!httpServer) return null;
+    if (requestQueue.length) return requestQueue.shift() ?? null;
+
+    const waitMs = Math.max(1000, Math.min(120_000, Number(timeoutMs) || 30_000));
+    return new Promise(resolve => {
+        const waiter: DequeueWaiter = {
+            resolve,
+            timer: setTimeout(() => {
+                const i = dequeueWaiters.indexOf(waiter);
+                if (i >= 0) dequeueWaiters.splice(i, 1);
+                resolve(null);
+            }, waitMs),
+        };
+        dequeueWaiters.push(waiter);
+    });
+}
+
+/** Renderer → main: finish a dequeued request so the WS client gets its response. */
+export async function completeRequest(
+    _event: IpcMainInvokeEvent,
+    id: string,
+    response: unknown
+): Promise<void> {
+    const key = String(id || "");
+    const pending = replyWaiters.get(key);
+    if (!pending) return;
+    replyWaiters.delete(key);
+    clearTimeout(pending.timer);
+    pending.resolve(response);
+}
+
+function enqueueForRenderer(request: unknown): Promise<unknown> {
+    const id = String((request as { id?: unknown; })?.id ?? "");
+    if (!id) {
+        return Promise.reject(new Error("Missing request id"));
+    }
+    if (replyWaiters.has(id)) {
+        return Promise.reject(new Error(`Duplicate in-flight request id: ${id}`));
+    }
+    if (requestQueue.length >= MAX_REQUEST_QUEUE && dequeueWaiters.length === 0) {
+        return Promise.reject(new Error("Renderer request queue full — is the plugin pump running?"));
+    }
+
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            replyWaiters.delete(id);
+            reject(new Error("Timed out waiting for renderer to handle bridge request"));
+        }, RENDERER_REPLY_TIMEOUT_MS);
+
+        replyWaiters.set(id, { resolve, reject, timer });
+
+        if (dequeueWaiters.length) {
+            const w = dequeueWaiters.shift()!;
+            clearTimeout(w.timer);
+            w.resolve(request);
+        } else {
+            requestQueue.push(request);
+        }
+    });
 }
 
 function parseTokenFromUrl(url: string | undefined): string | null {
@@ -212,6 +289,13 @@ function handleUpgrade(req: IncomingMessage, socket: Duplex, _head: Buffer) {
 
     const onData = (chunk: Buffer) => {
         buffer = Buffer.concat([buffer, chunk]);
+        if (buffer.length > MAX_SOCKET_BUFFER) {
+            try {
+                socket.write(encodeCloseFrame(1009, "buffer overflow"));
+            } catch { /* ignore */ }
+            socket.destroy();
+            return;
+        }
         while (true) {
             const frame = tryDecodeFrame(buffer);
             if (!frame) break;
@@ -225,7 +309,7 @@ function handleUpgrade(req: IncomingMessage, socket: Duplex, _head: Buffer) {
                 return;
             }
             if (frame.opcode === 0x9) {
-                // ping → pong
+                // ping → pong (protocol keepalive — never touches the renderer)
                 const pong = Buffer.allocUnsafe(2 + frame.payload.length);
                 pong[0] = 0x8a;
                 pong[1] = frame.payload.length;
@@ -242,14 +326,20 @@ function handleUpgrade(req: IncomingMessage, socket: Duplex, _head: Buffer) {
         }
     };
 
-    socket.on("data", onData);
-    socket.on("close", () => {
+    const onClose = () => {
+        socket.off("data", onData);
+        socket.off("close", onClose);
+        socket.off("error", onError);
         sockets.delete(socket);
-    });
-    socket.on("error", () => {
-        sockets.delete(socket);
+    };
+    const onError = () => {
+        onClose();
         try { socket.destroy(); } catch { /* ignore */ }
-    });
+    };
+
+    socket.on("data", onData);
+    socket.on("close", onClose);
+    socket.on("error", onError);
 }
 
 async function handleClientMessage(
@@ -302,8 +392,22 @@ async function handleClientMessage(
         return;
     }
 
+    // Instant pong in main — no renderer / Discord UI involvement.
+    // delayMs>0 still goes to the renderer so Bridge-tests cancel harness can abort mid-wait.
+    if (msg?.type === "ping" && !(Number(msg.delayMs) > 0)) {
+        sendJson(socket, {
+            id,
+            ok: true,
+            pong: true,
+            delayMs: 0,
+            version: BRIDGE_VERSION,
+            plugin: "AshenMacrosBridge",
+        });
+        return;
+    }
+
     try {
-        const result = await invokeRenderer(msg) as Record<string, unknown>;
+        const result = await enqueueForRenderer(msg) as Record<string, unknown>;
         if (result && typeof result === "object" && "id" in result) {
             sendJson(socket, result);
         } else {
@@ -369,6 +473,8 @@ export async function startServer(
 export async function stopServer(_event: IpcMainInvokeEvent): Promise<void> {
     closeAllSockets();
     authToken = "";
+    clearRequestQueue();
+    clearReplyWaiters("Vencord bridge server stopped");
 
     if (!httpServer) return;
 

@@ -61,7 +61,7 @@ const OPTION_TYPE_USER = 6;
 
 const SessionStore = findByPropsLazy("getSessionId");
 
-function asErrorMessage(err: unknown): string {
+export function asErrorMessage(err: unknown): string {
     if (err == null) return "Unknown error";
     if (typeof err === "string") return err;
     if (err instanceof Error) return err.message || String(err);
@@ -86,6 +86,46 @@ function isUnknownIntegrationError(err: unknown): boolean {
 
 /** Last successful guild/user install type per application — avoids a failed POST + retry on every call. */
 const preferredIntegrationTypeByApp = new Map<string, number>();
+
+/** Last slash/interaction reply captured via waitForResponse (ephemerals have no Copy ID). */
+let lastInteractionReply: {
+    channelId: string;
+    messageId: string;
+    applicationId?: string;
+    flags: number;
+    buttons: FlattenedButton[];
+    at: number;
+} | null = null;
+
+/**
+ * Temporary Flux / interval cleanups for in-flight waits.
+ * Cleared on plugin stop so MESSAGE_* listeners cannot leak across toggles.
+ */
+const activeWaitCleanups = new Set<() => void>();
+
+function trackWaitCleanup(cleanup: () => void): () => void {
+    let ran = false;
+    const wrapped = () => {
+        if (ran) return;
+        ran = true;
+        activeWaitCleanups.delete(wrapped);
+        cleanup();
+    };
+    activeWaitCleanups.add(wrapped);
+    return wrapped;
+}
+
+/** Drop caches + abort any temporary Flux subscriptions / polls (plugin stop). */
+export function resetBridgeState(): void {
+    for (const cleanup of [...activeWaitCleanups]) {
+        try {
+            cleanup();
+        } catch { /* ignore */ }
+    }
+    activeWaitCleanups.clear();
+    preferredIntegrationTypeByApp.clear();
+    lastInteractionReply = null;
+}
 
 function rememberIntegrationType(applicationId: string | undefined, type: number): void {
     if (!applicationId || !Number.isFinite(type)) return;
@@ -636,7 +676,9 @@ function buildOptions(
     const schema: any[] = applicationCommand?.options ?? [];
     return options.map(opt => {
         const def = schema.find((o: any) => o.name === opt.name);
-        let type = opt.type ?? def?.type;
+        // Schema type wins — caller type 6 USER vs Ashen type 3 autocomplete
+        // would otherwise submit the wrong option type (e.g. /create user).
+        let type = def?.type ?? opt.type;
         if (type == null) {
             if (opt.options?.length) type = OPTION_TYPE_SUB_COMMAND;
             else if (typeof opt.value === "boolean") type = OPTION_TYPE_BOOLEAN;
@@ -751,16 +793,6 @@ function flattenButtons(message: any): FlattenedButton[] {
     visit(message?.components);
     return out;
 }
-
-/** Last slash/interaction reply captured via waitForResponse (ephemerals have no Copy ID). */
-let lastInteractionReply: {
-    channelId: string;
-    messageId: string;
-    applicationId?: string;
-    flags: number;
-    buttons: FlattenedButton[];
-    at: number;
-} | null = null;
 
 function rememberInteractionReply(
     summary: ReturnType<typeof summarizeInteractionMessage>
@@ -993,6 +1025,8 @@ function waitForInteractionMessage(
     const matchOpts = { ...opts, startedAtMs };
     return new Promise((resolve, reject) => {
         let settled = false;
+        let outcome: "resolve" | "reject" | null = null;
+        let outcomeValue: any;
         // Ephemeral create often lands without buttons; Ashen edits Confirm/Cancel in.
         let pendingWithoutButtons: any = null;
         // INTERACTION_SUCCESS often carries the ephemeral before MESSAGE_CREATE.
@@ -1002,7 +1036,7 @@ function waitForInteractionMessage(
             "INTERACTION_SUCCESS",
         ] as const;
 
-        const cleanup = () => {
+        const cleanup = trackWaitCleanup(() => {
             if (settled) return;
             settled = true;
             for (const t of types) {
@@ -1013,12 +1047,22 @@ function waitForInteractionMessage(
             opts.signal?.removeEventListener("abort", onAbort);
             clearTimeout(timer);
             clearInterval(poll);
-        };
+            if (outcome === "resolve") resolve(outcomeValue);
+            else reject(outcomeValue instanceof Error ? outcomeValue : new Error("cancelled"));
+        });
 
         const finish = (message: any) => {
             if (settled) return;
+            outcome = "resolve";
+            outcomeValue = message;
             cleanup();
-            resolve(message);
+        };
+
+        const fail = (err: Error) => {
+            if (settled) return;
+            outcome = "reject";
+            outcomeValue = err;
+            cleanup();
         };
 
         const tryResolve = (message: any) => {
@@ -1066,11 +1110,11 @@ function waitForInteractionMessage(
         };
 
         const onAbort = () => {
-            cleanup();
-            reject(new Error("cancelled"));
+            fail(new Error("cancelled"));
         };
 
         // MessageStore poll — some ephemeral creates are easy to miss on the bus.
+        // Only while an in-flight slash wait is active; torn down on settle / plugin stop.
         const poll = setInterval(() => {
             if (settled) return;
             scanStore();
@@ -1085,7 +1129,6 @@ function waitForInteractionMessage(
                 finish(pendingWithoutButtons);
                 return;
             }
-            cleanup();
             const recent = channelMessagesNewestFirst(opts.channelId).slice(0, 8).map(m => ({
                 id: m?.id,
                 flags: m?.flags,
@@ -1094,7 +1137,7 @@ function waitForInteractionMessage(
                 buttons: flattenButtons(m).length,
                 app: m?.application_id ?? m?.applicationId,
             }));
-            reject(new Error(
+            fail(new Error(
                 "Timed out waiting for interaction response message " +
                 `(channel=${opts.channelId}, command=${opts.commandName ?? "?"}, ` +
                 `app=${opts.applicationId ?? "?"}). ` +
@@ -1189,7 +1232,9 @@ async function waitForButtonLabelOnMessage(opts: {
 
     return new Promise(resolve => {
         let settled = false;
-        const done = (msg: any | null) => {
+        let result: any | null = null;
+        let hasResult = false;
+        const cleanup = trackWaitCleanup(() => {
             if (settled) return;
             settled = true;
             try {
@@ -1197,7 +1242,13 @@ async function waitForButtonLabelOnMessage(opts: {
             } catch { /* ignore */ }
             clearInterval(poll);
             clearTimeout(timer);
-            resolve(msg);
+            resolve(hasResult ? result : null);
+        });
+        const finish = (msg: any | null) => {
+            if (settled) return;
+            hasResult = true;
+            result = msg;
+            cleanup();
         };
         const onUpdate = (event: any) => {
             const message = messageFromCreateEvent(event);
@@ -1206,14 +1257,17 @@ async function waitForButtonLabelOnMessage(opts: {
                 rememberInteractionReply(
                     summarizeInteractionMessage(message, opts.channelId)
                 );
-                done(message);
+                finish(message);
             }
         };
         const poll = setInterval(() => {
             const hit = read();
-            if (hit) done(hit);
+            if (hit) finish(hit);
         }, 150);
-        const timer = setTimeout(() => done(null), Math.max(0, timeoutMs - (Date.now() - started)));
+        const timer = setTimeout(
+            () => finish(null),
+            Math.max(0, timeoutMs - (Date.now() - started))
+        );
         FluxDispatcher.subscribe("MESSAGE_UPDATE", onUpdate);
     });
 }
@@ -1316,13 +1370,15 @@ function waitForAutocompleteChoices(
 ): Promise<AutocompleteChoice[]> {
     return new Promise((resolve, reject) => {
         let settled = false;
+        let outcome: "resolve" | "reject" | null = null;
+        let outcomeValue: any;
         const types = [
             "APPLICATION_COMMAND_AUTOCOMPLETE_RESPONSE",
             "INTERACTION_SUCCESS",
             "INTERACTION_DATA_SUCCESS",
         ] as const;
 
-        const cleanup = () => {
+        const cleanup = trackWaitCleanup(() => {
             if (settled) return;
             settled = true;
             for (const t of types) {
@@ -1332,7 +1388,9 @@ function waitForAutocompleteChoices(
             }
             signal?.removeEventListener("abort", onAbort);
             clearTimeout(timer);
-        };
+            if (outcome === "resolve") resolve(outcomeValue);
+            else reject(outcomeValue instanceof Error ? outcomeValue : new Error("cancelled"));
+        });
 
         const onEvent = (event: any) => {
             if (eventNonce(event) && eventNonce(event) !== nonce) return;
@@ -1344,21 +1402,24 @@ function waitForAutocompleteChoices(
                 // Accept only autocomplete-shaped payloads without nonce.
                 if (!Array.isArray(event?.choices) && !Array.isArray(event?.data?.choices)) return;
             }
+            outcome = "resolve";
+            outcomeValue = choices;
             cleanup();
-            resolve(choices);
         };
 
         const onAbort = () => {
+            outcome = "reject";
+            outcomeValue = new Error("cancelled");
             cleanup();
-            reject(new Error("cancelled"));
         };
 
         const timer = setTimeout(() => {
-            cleanup();
-            reject(new Error(
+            outcome = "reject";
+            outcomeValue = new Error(
                 "Autocomplete timed out waiting for Discord choices. " +
                 "Open /prep once in that channel so the command index is warm, then retry."
-            ));
+            );
+            cleanup();
         }, timeoutMs);
 
         for (const t of types) FluxDispatcher.subscribe(t, onEvent);
@@ -1370,6 +1431,12 @@ function waitForAutocompleteChoices(
             signal.addEventListener("abort", onAbort, { once: true });
         }
     });
+}
+
+/** First <@id> in an Ashen queue autocomplete label is the line owner. */
+function queueLineOwnerId(choiceName: string): string | null {
+    const m = String(choiceName ?? "").match(/<@!?(\d{16,20})>/);
+    return m?.[1] ?? null;
 }
 
 function pickAutocompleteChoice(
@@ -1386,6 +1453,23 @@ function pickAutocompleteChoice(
         if (exactValue) return exactValue;
         const exactName = choices.find(c => c.name.toLowerCase() === q);
         if (exactName) return exactName;
+
+        // /prep target and /process member queries are Discord snowflakes. Queue
+        // labels look like "2: <@owner> -- … w/ <@friend>". Loose name.includes
+        // would match the friend's line when processing the owner (longer label
+        // wins) — prefer the choice whose *first* mention is the queried id.
+        if (/^\d{16,20}$/.test(q)) {
+            const owners = choices.filter(c => queueLineOwnerId(c.name) === q);
+            if (owners.length) {
+                const strict = owners.find(c =>
+                    new RegExp(`^\\s*\\d+\\s*:\\s*<@!?${q}>`, "i").test(c.name)
+                );
+                return strict ?? owners[0];
+            }
+            // No mention-shaped labels — do not use includes (friend mentions).
+            return choices[0];
+        }
+
         // Prefer longest name containment (e.g. query "Ships requiring crew queue message"
         // vs short labels like "Ships full").
         const containing = choices
@@ -1768,7 +1852,7 @@ export async function handleAction(
                     await new Promise(r => setTimeout(r, Math.min(step, end - Date.now())));
                 }
             }
-            return { pong: true, delayMs, version: "2026.33.8", plugin: "AshenMacrosBridge" };
+            return { pong: true, delayMs, version: "2026.36.0", plugin: "AshenMacrosBridge" };
         }
 
         case "react": {
@@ -1881,4 +1965,4 @@ export async function handleAction(
     }
 }
 
-export { asErrorMessage, COMMAND_TYPE_CHAT_INPUT, COMMAND_TYPE_MESSAGE };
+export { COMMAND_TYPE_CHAT_INPUT, COMMAND_TYPE_MESSAGE };

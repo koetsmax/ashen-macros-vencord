@@ -109,12 +109,19 @@ For `/prep` and `/process`, use **type 3** (`STRING`) with the value you would t
 
 | File | Role |
 |---|---|
-| `index.tsx` | `definePlugin`, settings, start/stop, cancel map, renderer request dispatch |
-| `native.ts` | Electron main: `127.0.0.1` WebSocket server → `webContents.executeJavaScript` into Discord |
+| `index.tsx` | `definePlugin`, settings, start/stop, cancel map, IPC request pump |
+| `native.ts` | Electron main: `127.0.0.1` WebSocket server + `dequeueRequest` / `completeRequest` IPC |
 | `actions.ts` | ReactionActions / MessageActions / ChannelRouter / RestAPI interaction submitter |
 | `types.ts` | Request/response TypeScript shapes |
 
-Renderer cannot open a listening socket (browser WebSocket is client-only), so the server lives in `native.ts` and forwards each request into the Discord renderer where webpack modules exist.
+Renderer cannot open a listening socket (browser WebSocket is client-only), so the server lives in `native.ts`. The renderer runs a dequeue/complete IPC pump (no `webContents.executeJavaScript` per request). Idle connections stay on protocol ping/pong in main only.
+
+## Performance notes
+
+- **Idle:** Macros’ websocket-client keepalive (`ping_interval=20`) is answered in Electron main — Discord’s UI thread is not involved.
+- **Commands:** Handled via `dequeueRequest` / `completeRequest` PluginNative IPC instead of compiling a new `executeJavaScript` script each time (that path was the main progressive-lag risk under load).
+- **Temporary Flux waits** (`MESSAGE_CREATE` / autocomplete) register cleanups and are torn down on settle **and** on plugin `stop()` so listeners cannot accumulate.
+- Cap: WS receive buffer 1 MiB; pending renderer queue max 32.
 
 ## Caveats
 
