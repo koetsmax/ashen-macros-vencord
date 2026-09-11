@@ -11,6 +11,10 @@ Ashen Macros (PySide6) remains the brain; this plugin is the hands inside Discor
 
 ## Install
 
+**Recommended:** Ashen Macros → Settings → Experimental → **Setup / Repair**. That installs git/Node/pnpm if needed, clones Vencord + this plugin, builds, and opens `pnpm inject`. Use **Update plugin & Vencord** for later updates.
+
+### Manual install (advanced)
+
 1. Clone this repo (or copy its contents) into your Vencord tree:
 
 ```bash
@@ -29,6 +33,7 @@ Folder name can be `ashenMacrosBridge` or similar; Vencord loads any `userplugin
 
 5. In Ashen Macros → Settings → **Experimental → Vencord Discord bridge**, enable the bridge and enter the **same port + token**.
 
+**Vesktop:** after building, point Vesktop Settings → Vencord Location at your Vencord `dist` folder — see [Installing Vencord](https://docs.vencord.dev/installing/).
 ## Auth
 
 - Bind address is always `127.0.0.1` (never `0.0.0.0`).
