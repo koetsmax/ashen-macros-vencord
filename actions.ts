@@ -59,6 +59,15 @@ const OPTION_TYPE_STRING = 3;
 const OPTION_TYPE_BOOLEAN = 5;
 const OPTION_TYPE_USER = 6;
 
+/** Option types that Discord allows with autocomplete. */
+const OPTION_TYPE_INTEGER = 4;
+const OPTION_TYPE_NUMBER = 10;
+const AUTOCOMPLETEABLE_OPTION_TYPES = new Set([
+    OPTION_TYPE_STRING,
+    OPTION_TYPE_INTEGER,
+    OPTION_TYPE_NUMBER,
+]);
+
 const SessionStore = findByPropsLazy("getSessionId");
 
 export function asErrorMessage(err: unknown): string {
@@ -674,8 +683,14 @@ function buildOptions(
     if (!options?.length) return undefined;
 
     const schema: any[] = applicationCommand?.options ?? [];
-    return options.map(opt => {
+    const hasSchema = schema.length > 0;
+    const out: any[] = [];
+    for (const opt of options) {
         const def = schema.find((o: any) => o.name === opt.name);
+        // Drop options Discord's schema does not know — unknown keys → 50035.
+        if (hasSchema && !def && !opt.options?.length) {
+            continue;
+        }
         // Schema type wins — caller type 6 USER vs Ashen type 3 autocomplete
         // would otherwise submit the wrong option type (e.g. /create user).
         let type = def?.type ?? opt.type;
@@ -694,10 +709,22 @@ function buildOptions(
         ) {
             const childSchema = def?.options ?? [];
             const nested = buildOptions(opt.options, { options: childSchema }) ?? [];
-            return { type: type ?? OPTION_TYPE_SUB_COMMAND, name: opt.name, options: nested };
+            out.push({ type: type ?? OPTION_TYPE_SUB_COMMAND, name: opt.name, options: nested });
+            continue;
         }
-        return { type, name: opt.name, value: opt.value };
-    });
+        let value = opt.value;
+        // USER options must be snowflake strings — never boolean/object leftovers.
+        if (type === OPTION_TYPE_USER) {
+            value = String(value ?? "").replace(/[<@!>]/g, "");
+        } else if (type === OPTION_TYPE_BOOLEAN) {
+            value = Boolean(value);
+        } else if (type === OPTION_TYPE_STRING || type === OPTION_TYPE_INTEGER || type === OPTION_TYPE_NUMBER) {
+            // STRING stays string; Discord rejects number-typed STRING values.
+            if (type === OPTION_TYPE_STRING) value = String(value ?? "");
+        }
+        out.push({ type, name: opt.name, value });
+    }
+    return out.length ? out : undefined;
 }
 
 async function postApplicationCommand(body: Record<string, unknown>): Promise<void> {
@@ -1666,14 +1693,29 @@ async function resolveSlashOptions(
         }
 
         const callerAuto = options?.find(o => o.name === opt.name)?.autocomplete;
+        const effectiveType = Number(opt.type ?? def?.type ?? OPTION_TYPE_STRING);
+        // Discord only allows autocomplete on STRING / INTEGER / NUMBER.
+        // Forcing autocomplete on USER (common /create mistake) → 50035.
+        const canAutocomplete = AUTOCOMPLETEABLE_OPTION_TYPES.has(effectiveType);
         // Explicit false wins (skip POST even if the schema marks autocomplete).
         // Explicit true or schema autocomplete → resolve via Discord.
         const wantsAuto =
-            callerAuto === true
-            || (callerAuto !== false && def?.autocomplete === true);
+            canAutocomplete
+            && (
+                callerAuto === true
+                || (callerAuto !== false && def?.autocomplete === true)
+            );
 
         if (!wantsAuto) {
-            out.push({ name: opt.name, type: opt.type, value: opt.value });
+            let value = opt.value;
+            if (effectiveType === OPTION_TYPE_USER) {
+                value = String(value ?? "").replace(/[<@!>]/g, "");
+            } else if (effectiveType === OPTION_TYPE_BOOLEAN) {
+                value = Boolean(value);
+            } else if (effectiveType === OPTION_TYPE_STRING) {
+                value = String(value ?? "");
+            }
+            out.push({ name: opt.name, type: opt.type ?? effectiveType, value });
             continue;
         }
 
