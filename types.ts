@@ -36,6 +36,12 @@ export interface SlashOption {
      * - omitted: follow the command schema
      */
     autocomplete?: boolean;
+    /**
+     * Display name / nickname hint for Ashen queue member autocomplete.
+     * Used when choice labels are `5: Max -- … with @Friend` (no `<@id>`),
+     * so mutual "with" pairs do not resolve to the partner's UUID.
+     */
+    matchHint?: string;
 }
 
 export interface AutocompleteChoice {
@@ -81,6 +87,8 @@ export interface BridgeRequest {
     query?: string;
     /** Prefer this choice index after autocomplete (default: best match / first). */
     choiceIndex?: number;
+    /** Optional display-name hint when resolving member/target autocomplete alone. */
+    matchHint?: string;
 
     // slashCommand — wait for ephemeral / interaction response message
     waitForResponse?: boolean;
