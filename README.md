@@ -88,7 +88,7 @@ Discord application-command option types (the Bridge tests “type” spinbox):
 | 10 | `NUMBER` | float | Decimal numbers |
 | 11 | `ATTACHMENT` | attachment id | File upload |
 
-For `/prep` and `/process`, use **type 3** (`STRING`) with the value you would type before Tab (Discord user id, ship query like `1 5`). Set `"autocomplete": true` on the option (or rely on the command schema) so the bridge resolves the visible label to the UUID Discord actually submits.
+For `/prep` and `/process`, use **type 3** (`STRING`) with the value you would type before Tab (Discord user id, ship query like `1 5`). Set `"autocomplete": true` on the option (or rely on the command schema) so the bridge resolves the visible label to the UUID Discord actually submits. Optional `"matchHint": "DisplayName"` disambiguates mutual “with” queue pairs (owner line vs partner line).
 
 ### Examples
 

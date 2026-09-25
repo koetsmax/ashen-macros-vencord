@@ -59,6 +59,15 @@ const OPTION_TYPE_STRING = 3;
 const OPTION_TYPE_BOOLEAN = 5;
 const OPTION_TYPE_USER = 6;
 
+/** Option types that Discord allows with autocomplete. */
+const OPTION_TYPE_INTEGER = 4;
+const OPTION_TYPE_NUMBER = 10;
+const AUTOCOMPLETEABLE_OPTION_TYPES = new Set([
+    OPTION_TYPE_STRING,
+    OPTION_TYPE_INTEGER,
+    OPTION_TYPE_NUMBER,
+]);
+
 const SessionStore = findByPropsLazy("getSessionId");
 
 export function asErrorMessage(err: unknown): string {
@@ -674,8 +683,14 @@ function buildOptions(
     if (!options?.length) return undefined;
 
     const schema: any[] = applicationCommand?.options ?? [];
-    return options.map(opt => {
+    const hasSchema = schema.length > 0;
+    const out: any[] = [];
+    for (const opt of options) {
         const def = schema.find((o: any) => o.name === opt.name);
+        // Drop options Discord's schema does not know — unknown keys → 50035.
+        if (hasSchema && !def && !opt.options?.length) {
+            continue;
+        }
         // Schema type wins — caller type 6 USER vs Ashen type 3 autocomplete
         // would otherwise submit the wrong option type (e.g. /create user).
         let type = def?.type ?? opt.type;
@@ -694,10 +709,22 @@ function buildOptions(
         ) {
             const childSchema = def?.options ?? [];
             const nested = buildOptions(opt.options, { options: childSchema }) ?? [];
-            return { type: type ?? OPTION_TYPE_SUB_COMMAND, name: opt.name, options: nested };
+            out.push({ type: type ?? OPTION_TYPE_SUB_COMMAND, name: opt.name, options: nested });
+            continue;
         }
-        return { type, name: opt.name, value: opt.value };
-    });
+        let value = opt.value;
+        // USER options must be snowflake strings — never boolean/object leftovers.
+        if (type === OPTION_TYPE_USER) {
+            value = String(value ?? "").replace(/[<@!>]/g, "");
+        } else if (type === OPTION_TYPE_BOOLEAN) {
+            value = Boolean(value);
+        } else if (type === OPTION_TYPE_STRING || type === OPTION_TYPE_INTEGER || type === OPTION_TYPE_NUMBER) {
+            // STRING stays string; Discord rejects number-typed STRING values.
+            if (type === OPTION_TYPE_STRING) value = String(value ?? "");
+        }
+        out.push({ type, name: opt.name, value });
+    }
+    return out.length ? out : undefined;
 }
 
 async function postApplicationCommand(body: Record<string, unknown>): Promise<void> {
@@ -1433,16 +1460,88 @@ function waitForAutocompleteChoices(
     });
 }
 
-/** First <@id> in an Ashen queue autocomplete label is the line owner. */
+/** Owner text of Ashen queue autocomplete labels (`5: Max -- …` / `5: <@id> -- …`). */
+function queueLineOwnerSegment(choiceName: string): string {
+    const text = String(choiceName ?? "");
+    const m = text.match(/^\s*\d+\s*:\s*(.+?)(?:\s*--|\s*$)/);
+    return (m?.[1] ?? "").trim();
+}
+
+/** Prefer the owner-segment mention; fall back to the first <@id> in the label. */
 function queueLineOwnerId(choiceName: string): string | null {
-    const m = String(choiceName ?? "").match(/<@!?(\d{16,20})>/);
-    return m?.[1] ?? null;
+    const seg = queueLineOwnerSegment(choiceName);
+    const segMention = seg.match(/<@!?(\d{16,20})>/);
+    if (segMention) return segMention[1];
+    const raw = seg.match(/^(\d{16,20})\b/);
+    if (raw) return raw[1];
+    const any = String(choiceName ?? "").match(/<@!?(\d{16,20})>/);
+    return any?.[1] ?? null;
+}
+
+function escapeRegExp(text: string): string {
+    return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Display-name / username tokens for a snowflake (UserStore + optional caller hint). */
+function nameHintsForUserId(userId: string, matchHint?: string): string[] {
+    const hints: string[] = [];
+    const hint = String(matchHint ?? "").trim();
+    if (hint) hints.push(hint.toLowerCase());
+    try {
+        const user = UserStore.getUser(userId) as {
+            username?: string;
+            globalName?: string;
+            displayName?: string;
+        } | undefined;
+        if (user) {
+            for (const key of ["username", "globalName", "displayName"] as const) {
+                const v = String(user[key] ?? "").trim();
+                if (v) hints.push(v.toLowerCase());
+            }
+        }
+    } catch {
+        /* UserStore may be unavailable in tests / early boot */
+    }
+    return [...new Set(hints.filter(Boolean))];
+}
+
+function ownerSegmentMatches(segment: string, queryId: string, hints: string[]): boolean {
+    const seg = String(segment ?? "");
+    if (!seg) return false;
+    if (seg.includes(`<@${queryId}>`) || seg.includes(`<@!${queryId}>`)) return true;
+    if (new RegExp(`(^|\\s)${escapeRegExp(queryId)}(\\s|$)`).test(seg)) return true;
+    const cleaned = seg.replace(/^@+/, "").trim().toLowerCase();
+    for (const h of hints) {
+        if (!h || h.length < 2) continue;
+        if (cleaned === h || cleaned.startsWith(`${h} `)) return true;
+        if (new RegExp(`(^|\\s|@)${escapeRegExp(h)}(\\s|$|,)`, "i").test(seg)) return true;
+    }
+    return false;
+}
+
+/**
+ * Score a queue member/target autocomplete choice for a snowflake query.
+ * Owner-line matches beat friend/"with" mentions so mutual pairs resolve correctly.
+ */
+function scoreQueueMemberChoice(
+    choice: AutocompleteChoice,
+    queryId: string,
+    hints: string[]
+): number {
+    const name = String(choice.name ?? "");
+    if (queueLineOwnerId(name) === queryId) return 100;
+    if (ownerSegmentMatches(queueLineOwnerSegment(name), queryId, hints)) return 90;
+    const lower = name.toLowerCase();
+    if (lower.includes(queryId)) return 10;
+    if (hints.some(h => h.length >= 3 && lower.includes(h))) return 10;
+    return 0;
 }
 
 function pickAutocompleteChoice(
     choices: AutocompleteChoice[],
     query: string,
-    choiceIndex?: number
+    choiceIndex?: number,
+    matchHint?: string
 ): AutocompleteChoice {
     if (!choices.length) throw new Error("No autocomplete choices returned");
     if (choiceIndex != null && choices[choiceIndex]) return choices[choiceIndex];
@@ -1454,19 +1553,34 @@ function pickAutocompleteChoice(
         const exactName = choices.find(c => c.name.toLowerCase() === q);
         if (exactName) return exactName;
 
-        // /prep target and /process member queries are Discord snowflakes. Queue
-        // labels look like "2: <@owner> -- … w/ <@friend>". Loose name.includes
-        // would match the friend's line when processing the owner (longer label
-        // wins) — prefer the choice whose *first* mention is the queried id.
+        // /prep target and /process member queries are Discord snowflakes.
+        // Ashen labels are often "2: DisplayName -- Anything: with @Friend" (no
+        // <@id>). Mutual "with" pairs return both lines for either id — pick the
+        // line whose *owner* matches the queried user, never the partner.
         if (/^\d{16,20}$/.test(q)) {
-            const owners = choices.filter(c => queueLineOwnerId(c.name) === q);
-            if (owners.length) {
-                const strict = owners.find(c =>
+            const hints = nameHintsForUserId(q, matchHint);
+            const ranked = choices
+                .map(c => ({ c, score: scoreQueueMemberChoice(c, q, hints) }))
+                .sort((a, b) => b.score - a.score);
+            if (ranked[0]?.score > 0) {
+                const topScore = ranked[0].score;
+                const top = ranked.filter(r => r.score === topScore).map(r => r.c);
+                const strict = top.find(c =>
                     new RegExp(`^\\s*\\d+\\s*:\\s*<@!?${q}>`, "i").test(c.name)
                 );
-                return strict ?? owners[0];
+                return strict ?? top[0];
             }
-            // No mention-shaped labels — do not use includes (friend mentions).
+            // No owner/hint match — only safe when Discord returned a single choice.
+            if (choices.length === 1) return choices[0];
+            // Still ambiguous (mutual with, cold UserStore): prefer label that
+            // starts with the queue index + hint token if any hint matches a
+            // unique owner segment.
+            if (hints.length) {
+                const byHint = choices.filter(c =>
+                    ownerSegmentMatches(queueLineOwnerSegment(c.name), q, hints)
+                );
+                if (byHint.length === 1) return byHint[0];
+            }
             return choices[0];
         }
 
@@ -1517,6 +1631,8 @@ async function fetchAutocompleteChoices(opts: {
     rootCommand?: any;
     signal?: AbortSignal;
     choiceIndex?: number;
+    /** Display-name hint so mutual "with" pairs pick the line owner, not the friend. */
+    matchHint?: string;
 }): Promise<{ choices: AutocompleteChoice[]; picked: AutocompleteChoice; commandId: string; }> {
     const pathHints = (opts.optionPath ?? []).map(p => p.name);
     const cmd = await ensureApplicationCommand(
@@ -1603,7 +1719,12 @@ async function fetchAutocompleteChoices(opts: {
     try {
         await postApplicationCommandWithIntegrationFallback(body);
         const choices = await pending;
-        const picked = pickAutocompleteChoice(choices, opts.query, opts.choiceIndex);
+        const picked = pickAutocompleteChoice(
+            choices,
+            opts.query,
+            opts.choiceIndex,
+            opts.matchHint
+        );
         return { choices, picked, commandId };
     } catch (err) {
         localAbort.abort();
@@ -1665,15 +1786,32 @@ async function resolveSlashOptions(
             continue;
         }
 
-        const callerAuto = options?.find(o => o.name === opt.name)?.autocomplete;
+        const callerOpt = options?.find(o => o.name === opt.name);
+        const callerAuto = callerOpt?.autocomplete;
+        const matchHint = callerOpt?.matchHint;
+        const effectiveType = Number(opt.type ?? def?.type ?? OPTION_TYPE_STRING);
+        // Discord only allows autocomplete on STRING / INTEGER / NUMBER.
+        // Forcing autocomplete on USER (common /create mistake) → 50035.
+        const canAutocomplete = AUTOCOMPLETEABLE_OPTION_TYPES.has(effectiveType);
         // Explicit false wins (skip POST even if the schema marks autocomplete).
         // Explicit true or schema autocomplete → resolve via Discord.
         const wantsAuto =
-            callerAuto === true
-            || (callerAuto !== false && def?.autocomplete === true);
+            canAutocomplete
+            && (
+                callerAuto === true
+                || (callerAuto !== false && def?.autocomplete === true)
+            );
 
         if (!wantsAuto) {
-            out.push({ name: opt.name, type: opt.type, value: opt.value });
+            let value = opt.value;
+            if (effectiveType === OPTION_TYPE_USER) {
+                value = String(value ?? "").replace(/[<@!>]/g, "");
+            } else if (effectiveType === OPTION_TYPE_BOOLEAN) {
+                value = Boolean(value);
+            } else if (effectiveType === OPTION_TYPE_STRING) {
+                value = String(value ?? "");
+            }
+            out.push({ name: opt.name, type: opt.type ?? effectiveType, value });
             continue;
         }
 
@@ -1687,6 +1825,7 @@ async function resolveSlashOptions(
             optionPath,
             signal,
             choiceIndex,
+            matchHint: matchHint != null ? String(matchHint) : undefined,
         });
         resolutions[opt.name] = picked;
         // Discord STRING options must be strings — choice values may be numbers.
@@ -1852,7 +1991,7 @@ export async function handleAction(
                     await new Promise(r => setTimeout(r, Math.min(step, end - Date.now())));
                 }
             }
-            return { pong: true, delayMs, version: "2026.36.0", plugin: "AshenMacrosBridge" };
+            return { pong: true, delayMs, version: "2026.38.0", plugin: "AshenMacrosBridge" };
         }
 
         case "react": {
@@ -1950,6 +2089,7 @@ export async function handleAction(
                 otherOptions: req.options,
                 signal,
                 choiceIndex: req.choiceIndex,
+                matchHint: req.matchHint != null ? String(req.matchHint) : undefined,
             });
             return {
                 choices: result.choices,
