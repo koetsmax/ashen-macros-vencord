@@ -244,6 +244,15 @@ function getGuildId(channelId: string, explicit?: string): string | undefined {
     return channel?.guild_id ?? undefined;
 }
 
+/** Reject with `message` when `promise` does not settle within `ms`. */
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 /** DM channel type in ChannelStore. */
 const CHANNEL_TYPE_DM = 1;
 
@@ -2035,7 +2044,7 @@ export async function handleAction(
                     await new Promise(r => setTimeout(r, Math.min(step, end - Date.now())));
                 }
             }
-            return { pong: true, delayMs, version: "2026.44.0", plugin: "AshenMacrosBridge" };
+            return { pong: true, delayMs, version: "2026.44.1", plugin: "AshenMacrosBridge" };
         }
 
         case "react": {
@@ -2063,8 +2072,21 @@ export async function handleAction(
         case "sendDm": {
             if (req.content == null) throw new Error("content is required");
             if (!req.userId && !req.username) throw new Error("userId or username is required");
-            const channelId = await resolveDmChannel(req.userId, req.username);
-            await vencordSendMessage(channelId, { content: req.content });
+            const channelId = await withTimeout(
+                resolveDmChannel(req.userId, req.username),
+                10_000,
+                "Opening the DM channel timed out"
+            );
+            // A DM that was never opened this session is not "ready" in Discord's
+            // message queue, and sendMessage can wait on it forever. Open it first.
+            ChannelRouter.transitionToChannel(channelId);
+            await new Promise(r => setTimeout(r, 750));
+            if (signal?.aborted) throw new Error("cancelled");
+            await withTimeout(
+                vencordSendMessage(channelId, { content: req.content }),
+                15_000,
+                "Sending the DM timed out (Discord did not confirm the message)"
+            );
             return { channelId };
         }
 
