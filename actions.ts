@@ -244,6 +244,50 @@ function getGuildId(channelId: string, explicit?: string): string | undefined {
     return channel?.guild_id ?? undefined;
 }
 
+/** DM channel type in ChannelStore. */
+const CHANNEL_TYPE_DM = 1;
+
+/** Find a cached user by username (case-insensitive; also matches global name). */
+function findUserIdByUsername(username: string): string | undefined {
+    const want = username.trim().replace(/^@/, "").toLowerCase();
+    if (!want) return undefined;
+    const users = Object.values((UserStore as any).getUsers?.() ?? {}) as any[];
+    const hit = users.find(u => String(u?.username ?? "").toLowerCase() === want)
+        ?? users.find(u => String(u?.globalName ?? u?.global_name ?? "").toLowerCase() === want);
+    return hit?.id ? String(hit.id) : undefined;
+}
+
+/** Existing DM channel with this user, else open one via POST /users/@me/channels. */
+async function resolveDmChannel(userId?: string, username?: string): Promise<string> {
+    const uid = String(userId ?? "").trim() || (username ? findUserIdByUsername(username) : undefined);
+    if (!uid) {
+        throw new Error(
+            `Could not find user ${username ? `"${username}"` : "(no userId/username)"}. `
+            + "Open a DM with them once in Discord, then retry."
+        );
+    }
+    const existing = (ChannelStore as any).getDMFromUserId?.(uid);
+    if (existing) return String(existing);
+    const privates = ((ChannelStore as any).getSortedPrivateChannels?.() ?? []) as any[];
+    const match = privates.find(c =>
+        c?.type === CHANNEL_TYPE_DM
+        && (c.recipients ?? c.rawRecipients?.map((r: any) => r?.id) ?? []).map(String).includes(uid)
+    );
+    if (match?.id) return String(match.id);
+
+    const res = await RestAPI.post({
+        url: "/users/@me/channels",
+        body: { recipients: [uid] },
+        rejectWithError: false,
+    } as any);
+    const status = res?.status ?? res?.statusCode;
+    const id = res?.body?.id;
+    if ((status != null && status >= 400) || !id) {
+        throw new Error(asErrorMessage(res?.body ?? res) || `open DM HTTP ${status}`);
+    }
+    return String(id);
+}
+
 function makeNonce(): string {
     return SnowflakeUtils.fromTimestamp(Date.now());
 }
@@ -1991,7 +2035,7 @@ export async function handleAction(
                     await new Promise(r => setTimeout(r, Math.min(step, end - Date.now())));
                 }
             }
-            return { pong: true, delayMs, version: "2026.38.0", plugin: "AshenMacrosBridge" };
+            return { pong: true, delayMs, version: "2026.44.0", plugin: "AshenMacrosBridge" };
         }
 
         case "react": {
@@ -2014,6 +2058,14 @@ export async function handleAction(
             // Must pass options (4th arg); Discord reads options.nonce and crashes if options is undefined.
             await vencordSendMessage(req.channelId, { content: req.content });
             return {};
+        }
+
+        case "sendDm": {
+            if (req.content == null) throw new Error("content is required");
+            if (!req.userId && !req.username) throw new Error("userId or username is required");
+            const channelId = await resolveDmChannel(req.userId, req.username);
+            await vencordSendMessage(channelId, { content: req.content });
+            return { channelId };
         }
 
         case "switchChannel": {

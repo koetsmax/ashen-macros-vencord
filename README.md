@@ -64,6 +64,7 @@ On connect the plugin sends:
 | `react` | `channelId`, `messageId`, `emoji: { name, id? }` or string | `MessageActions.addReaction` |
 | `edit` | `channelId`, `messageId`, `content` | `MessageActions.editMessage` |
 | `send` | `channelId`, `content` | `MessageActions.sendMessage` |
+| `sendDm` | `content`, `userId` or `username` | Sends a DM; reuses the open DM channel or opens one (`POST /users/@me/channels`). A username must be in Discord's user cache. Returns `channelId`. Used by Ashen Macros account verification on Linux |
 | `switchChannel` | `channelId`, optional `guildId` | `ChannelRouter.transitionToChannel` |
 | `messageCommand` | `channelId`, `messageId`, optional `name` (default `"Update Bonus"`), optional `guildId` | MESSAGE context command via index + `POST /interactions` |
 | `slashCommand` | `channelId`, `name`, optional `options`, `guildId`, optional `waitForResponse` / `waitMs` | CHAT_INPUT slash via `/interactions`. When `waitForResponse` is true, waits for the ephemeral reply (with buttons) and returns `messageId`, `flags`, `buttons` |

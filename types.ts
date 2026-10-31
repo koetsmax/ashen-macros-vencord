@@ -10,6 +10,7 @@ export type BridgeActionType =
     | "react"
     | "edit"
     | "send"
+    | "sendDm"
     | "switchChannel"
     | "messageCommand"
     | "slashCommand"
@@ -97,6 +98,10 @@ export interface BridgeRequest {
 
     // clickButton — exact button label; messageId optional (last slash ephemeral)
     label?: string;
+
+    // sendDm — recipient by id, or by username (must be in Discord's user cache)
+    userId?: string;
+    username?: string;
 }
 
 /** Plugin → client */
