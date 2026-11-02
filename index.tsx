@@ -19,7 +19,7 @@ const logger = new Logger(PLUGIN_NAME);
 const settings = definePluginSettings({
     port: {
         type: OptionType.NUMBER,
-        description: "Localhost WebSocket port (must match Ashen Macros Experimental bridge port)",
+        description: "Localhost WebSocket port (must match the Ashen Macros Vencord plugin port)",
         default: 47832,
         restartNeeded: true,
     },
@@ -150,7 +150,7 @@ async function startBridge() {
     const token = String(settings.store.authToken || "change-me");
     if (token === "change-me") {
         logger.error(
-            "authToken is still the default \"change-me\". Set a shared secret in plugin settings and Ashen Macros Experimental before production use."
+            "authToken is still the default \"change-me\". Set a shared secret in plugin settings and Ashen Macros (Settings → Vencord plugin) before production use."
         );
     }
 
