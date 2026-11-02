@@ -2044,7 +2044,7 @@ export async function handleAction(
                     await new Promise(r => setTimeout(r, Math.min(step, end - Date.now())));
                 }
             }
-            return { pong: true, delayMs, version: "2026.44.1", plugin: "AshenMacrosBridge" };
+            return { pong: true, delayMs, version: "2026.45", plugin: "AshenMacrosBridge" };
         }
 
         case "react": {

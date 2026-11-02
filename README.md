@@ -27,17 +27,22 @@ Folder name can be `ashenMacrosBridge` or similar; Vencord loads any `userplugin
 
 3. Enable **AshenMacrosBridge** under Vencord → Plugins.
 
-4. Open plugin settings and set:
-   - **Port** — default `47832`
-   - **Auth token** — shared secret (change from `change-me`)
-
-5. In Ashen Macros → Settings → **Vencord plugin**, enable the bridge and enter the **same port + token**.
+4. That's it for the token: on start the plugin generates a random **Auth token** (if it is
+   empty, `change-me`, or shorter than 16 characters) and Vencord saves it. Ashen Macros reads it
+   from Vencord's `settings/settings.json`, so leave the token field in Ashen Macros empty.
+   Only change **Port** (default `47832`) if something else uses it, and set the same port in
+   Ashen Macros → Settings → **Vencord plugin**.
 
 **Vesktop:** after building, point Vesktop Settings → Vencord Location at your Vencord `dist` folder — see [Installing Vencord](https://docs.vencord.dev/installing/).
 ## Auth
 
 - Bind address is always `127.0.0.1` (never `0.0.0.0`).
 - Shared secret only — **not** your Discord user token and **not** an Ashen API token.
+- The server never runs with a default or short token (minimum 16 characters); the plugin
+  replaces one with a random 64-character hex token.
+- WebSocket upgrades with a browser `Origin` are refused (403), so web pages can't reach the
+  bridge. Clients may omit `Origin` or send `http://127.0.0.1[:port]` / `http://localhost[:port]`.
+- After 20 failed auth attempts within a minute, every auth attempt is refused for 30 seconds.
 - Authenticate either way:
   1. Query string: `ws://127.0.0.1:47832/?token=YOUR_SECRET`
   2. First JSON message: `{ "id": "1", "type": "auth", "token": "YOUR_SECRET" }`

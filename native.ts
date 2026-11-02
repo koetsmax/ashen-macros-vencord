@@ -12,16 +12,30 @@ import { IpcMainInvokeEvent } from "electron";
 import { createServer, IncomingMessage, Server } from "http";
 import type { Duplex } from "net";
 
+import { isWeakToken } from "./token";
+
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const HOST = "127.0.0.1";
 /** Keep in sync with package.json — shown in Ashen Macros hub Bridge status.
  *  Must NOT be exported: Vencord registers every native export as ipcMain.handle().
  */
-const BRIDGE_VERSION = "2026.44.1";
+const BRIDGE_VERSION = "2026.45";
 
 const MAX_SOCKET_BUFFER = 1024 * 1024;
 const MAX_REQUEST_QUEUE = 32;
 const RENDERER_REPLY_TIMEOUT_MS = 180_000;
+
+/** Failed auth attempts allowed per window before every attempt is refused for a while. */
+const AUTH_FAIL_LIMIT = 20;
+const AUTH_FAIL_WINDOW_MS = 60_000;
+const AUTH_LOCKOUT_MS = 30_000;
+
+/**
+ * Only non-browser clients (Ashen Macros, local scripts) should talk to the bridge.
+ * Browsers always send Origin on a WebSocket upgrade; native clients either omit it
+ * or (websocket-client) send the server's own http://127.0.0.1:<port>.
+ */
+const LOCAL_ORIGIN_RE = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i;
 
 let httpServer: Server | null = null;
 let authToken = "";
@@ -54,6 +68,37 @@ function tokensEqual(a: string, b: string): boolean {
     } catch {
         return false;
     }
+}
+
+let authFailures: number[] = [];
+let authLockedUntil = 0;
+
+function authLockedOut(): boolean {
+    return Date.now() < authLockedUntil;
+}
+
+function noteAuthFailure() {
+    const now = Date.now();
+    authFailures = authFailures.filter(t => now - t < AUTH_FAIL_WINDOW_MS);
+    authFailures.push(now);
+    if (authFailures.length >= AUTH_FAIL_LIMIT) {
+        authLockedUntil = now + AUTH_LOCKOUT_MS;
+        authFailures = [];
+    }
+}
+
+/** Constant-time compare that also refuses while too many guesses were made. */
+function checkToken(candidate: string): boolean {
+    if (authLockedOut()) return false;
+    const ok = tokensEqual(candidate, authToken);
+    if (!ok) noteAuthFailure();
+    return ok;
+}
+
+function isAllowedOrigin(origin: string | string[] | undefined): boolean {
+    if (origin == null) return true;
+    if (Array.isArray(origin)) return false;
+    return LOCAL_ORIGIN_RE.test(origin.trim());
 }
 
 function acceptKey(key: string): string {
@@ -265,8 +310,22 @@ function handleUpgrade(req: IncomingMessage, socket: Duplex, _head: Buffer) {
         return;
     }
 
+    // Block cross-site WebSocket hijacking: a web page open in the user's browser
+    // connects from 127.0.0.1 too, but its upgrade always carries its own Origin.
+    if (!isAllowedOrigin(req.headers.origin)) {
+        socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+        socket.destroy();
+        return;
+    }
+
+    if (!authToken || isWeakToken(authToken)) {
+        socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
+        socket.destroy();
+        return;
+    }
+
     const queryToken = parseTokenFromUrl(req.url);
-    let authenticated = !!(queryToken && tokensEqual(queryToken, authToken));
+    let authenticated = !!(queryToken && checkToken(queryToken));
 
     const headers =
         "HTTP/1.1 101 Switching Protocols\r\n" +
@@ -359,7 +418,7 @@ async function handleClientMessage(
     const id = msg?.id ?? null;
 
     if (msg?.type === "auth") {
-        if (tokensEqual(String(msg.token ?? ""), authToken)) {
+        if (checkToken(String(msg.token ?? ""))) {
             setAuthed(true);
             sendJson(socket, {
                 id,
@@ -381,7 +440,7 @@ async function handleClientMessage(
 
     const msgToken = msg?.token != null ? String(msg.token) : "";
     if (!isAuthed()) {
-        if (msgToken && tokensEqual(msgToken, authToken)) {
+        if (msgToken && checkToken(msgToken)) {
             setAuthed(true);
         } else {
             sendJson(socket, { id, ok: false, error: "Unauthorized — send auth or include token" });
@@ -443,10 +502,11 @@ export async function startServer(
         await stopServer(_event);
     }
 
-    authToken = token || "";
-    if (!authToken) {
-        throw new Error("authToken is required");
+    if (isWeakToken(token)) {
+        authToken = "";
+        throw new Error("Refusing to start: authToken is missing, the default, or too short");
     }
+    authToken = token;
 
     httpServer = createServer((_req, res) => {
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -489,5 +549,8 @@ export async function stopServer(_event: IpcMainInvokeEvent): Promise<void> {
 }
 
 export async function updateAuthToken(_event: IpcMainInvokeEvent, token: string): Promise<void> {
-    authToken = token || "";
+    if (isWeakToken(token)) {
+        throw new Error("Refusing weak authToken");
+    }
+    authToken = token;
 }

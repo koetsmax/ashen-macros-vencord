@@ -11,6 +11,7 @@ import { Logger } from "@utils/Logger";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
 
 import { asErrorMessage, handleAction, resetBridgeState } from "./actions";
+import { isWeakToken } from "./token";
 import type { BridgeRequest, BridgeResponse } from "./types";
 
 const PLUGIN_NAME = "AshenMacrosBridge";
@@ -26,8 +27,9 @@ const settings = definePluginSettings({
     authToken: {
         type: OptionType.STRING,
         description:
-            "Shared secret for Ashen Macros ↔ plugin auth. NOT your Discord token or Ashen API token.",
-        default: "change-me",
+            "Shared secret for Ashen Macros ↔ plugin auth. Generated automatically and read by Ashen Macros — "
+            + "leave it alone unless you know why. NOT your Discord token or Ashen API token.",
+        default: "",
         restartNeeded: true,
     },
 });
@@ -48,6 +50,12 @@ const inflight = new Map<string, AbortController>();
 
 /** Stops the renderer dequeue pump */
 let pumpAbort: AbortController | null = null;
+
+function generateToken(): string {
+    const bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+}
 
 function cancelledResponse(id: string): BridgeResponse {
     return { id, ok: false, error: "cancelled", cancelled: true };
@@ -147,11 +155,16 @@ async function startBridge() {
     }
 
     const port = Number(settings.store.port) || 47832;
-    const token = String(settings.store.authToken || "change-me");
-    if (token === "change-me") {
-        logger.error(
-            "authToken is still the default \"change-me\". Set a shared secret in plugin settings and Ashen Macros (Settings → Vencord plugin) before production use."
-        );
+    let token = String(settings.store.authToken ?? "").trim();
+    if (isWeakToken(token)) {
+        // Never serve with a guessable secret: any web page in the user's browser can
+        // reach 127.0.0.1. Replace it with a random one; Ashen Macros reads it back from
+        // Vencord's settings.json, so the user does not have to copy it anywhere.
+        if (token) {
+            logger.warn("authToken was the default or too short — replaced it with a random token.");
+        }
+        token = generateToken();
+        settings.store.authToken = token;
     }
 
     await native.startServer(port, token);
